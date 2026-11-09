@@ -1,0 +1,10 @@
+import fs from 'node:fs/promises';
+import {createRequire} from 'node:module';
+const require=createRequire('C:/AI/DSH/cli/package.json');
+const yaml=require('yaml');
+const home='C:/Users/nikol/.dsh';
+const bot=JSON.parse(await fs.readFile(`${home}/integrations/dsh-discord/config.json`,'utf8')).bots[0];
+const token=yaml.parse(await fs.readFile(`${home}/.credentials.yaml`,'utf8')).refs[bot.tokenRef];
+const r=await fetch('https://discord.com/api/v10/channels/1483931326427172965/messages/1569461419689119787',{headers:{authorization:`Bot ${token}`}});
+const m=await r.json();
+console.log(JSON.stringify({id:m.id, edited:m.edited_timestamp, components:(m.components??[]).length, contentTail:m.content.slice(-80)}));
