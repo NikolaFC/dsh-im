@@ -117,7 +117,7 @@ test('Gateway slash ACK precedes shared command delivery without message reactio
   });
   try {
     await runtime.start();
-    listeners.get('message')({ data: JSON.stringify({ op: 0, t: 'INTERACTION_CREATE', d: { ...event, data: { name: 'help', type: 1 } } }) });
+    listeners.get('message')({ data: JSON.stringify({ op: 0, t: 'INTERACTION_CREATE', d: { ...event, data: { name: 'reasoninglist', type: 1 } } }) });
     for (let i = 0; i < 100 && calls.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 5));
     assert.equal(calls[0][0], 'ack');
     assert.equal(calls[0][1].type, 4);

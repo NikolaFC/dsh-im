@@ -36,6 +36,12 @@ export async function discordCommandChoices(command, harness, state, key, signal
   return [];
 }
 
+export const DISCORD_HELP_BUTTONS = Object.freeze([
+  ['status', '状态'], ['models', '模型列表'], ['model', '切换模型'], ['reasoning', '推理等级'],
+  ['reasoninglist', '等级列表'], ['permission', '权限'], ['preset', '切换预设'], ['presets', '预设列表'],
+  ['ws', '工作区'], ['steer', '补充指令'], ['compact', '压缩上下文'], ['new', '新会话'], ['stop', '停止'],
+]);
+
 export class DiscordCommandPickers {
   #entries = new Map();
   issue(message, choices, sessionId) {
@@ -52,13 +58,31 @@ export class DiscordCommandPickers {
       components: [{ type: 1, components: [{ type: 3, custom_id: `dc1|${nonce}`, min_values: 1, max_values: 1,
         options: items.map((item, index) => ({ label: item.label.slice(0, 100), value: String(index) })) }] }] };
   }
+  issueHelp(message, sessionId) {
+    const card = this.issue(message, DISCORD_HELP_BUTTONS.map(([command, label]) => ({ label, command: `/${command}` })), sessionId);
+    const nonce = card.components[0].components[0].custom_id.split('|')[1];
+    const entry = this.#entries.get(nonce);
+    entry.help = true;
+    const buttons = DISCORD_HELP_BUTTONS.map(([command, label]) => ({ type: 2, style: 2, label, custom_id: `dbtn|${command}|${nonce}` }));
+    return { content: '点一个命令：', components: Array.from({ length: Math.ceil(buttons.length / 5) }, (_, index) => ({ type: 1, components: buttons.slice(index * 5, index * 5 + 5) })) };
+  }
   belongsTo(message) {
-    const nonce = /^dc1\|([A-Za-z0-9_-]{16})$/.exec(message.data ?? '')?.[1];
+    const nonce = /^dc1\|([A-Za-z0-9_-]{16})$/.exec(message.data ?? '')?.[1]
+      ?? /^dbtn\|[a-z]+\|([A-Za-z0-9_-]{16})$/.exec(message.data ?? '')?.[1];
     const entry = this.#entries.get(nonce);
     return Boolean(entry && entry.actor === message.senderId
       && entry.route === `${message.kind}:${message.conversationId}`);
   }
   claim(message, sessionId) {
+    const button = /^dbtn\|([a-z]+)\|([A-Za-z0-9_-]{16})$/.exec(message.data ?? '');
+    if (button) {
+      const entry = this.#entries.get(button[2]);
+      if (!entry?.help || entry.claimed || entry.expires < Date.now() || !this.belongsTo(message)
+        || entry.sessionId !== sessionId || message.componentType !== 2
+        || !entry.items.some(item => item.command === `/${button[1]}`)) return null;
+      entry.claimed = true;
+      return `/${button[1]}`;
+    }
     const match = /^dc1\|([A-Za-z0-9_-]{16})$/.exec(message.data ?? '');
     const entry = match && this.#entries.get(match[1]);
     const values = message.values;

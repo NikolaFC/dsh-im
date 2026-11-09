@@ -1046,11 +1046,13 @@ export class DiscordRuntime {
     const api = this.#api;
     const bridge = this.#bridge;
     if (!normalized || !api || !bridge) return;
-    const commandName = interaction.data?.name;
-    const pickerPress = interaction.type === 3 && normalized.data?.startsWith('dc1|');
-    const wantsPicker = interaction.type === 2 && (PICKER_COMMANDS.has(commandName) || commandName === 'steer')
+    let commandName = interaction.data?.name;
+    const buttonPress = interaction.type === 3 && normalized.data?.startsWith('dbtn|');
+    const pickerPress = interaction.type === 3 && (normalized.data?.startsWith('dc1|') || buttonPress);
+    const wantsHelp = interaction.type === 2 && commandName === 'help';
+    let wantsPicker = interaction.type === 2 && (PICKER_COMMANDS.has(commandName) || commandName === 'steer')
       && normalized.content === `/${commandName}`;
-    if (wantsPicker || pickerPress) {
+    if (wantsPicker || pickerPress || wantsHelp) {
       const signal = this.#abortController?.signal;
       await api.respondInteraction({ interactionId: interaction.id, token: interaction.token,
         type: pickerPress ? 6 : 5, ...(pickerPress ? {} : { data: { flags: 64 } }), signal });
@@ -1066,6 +1068,10 @@ export class DiscordRuntime {
           return;
         }
         normalized.content = command;
+        if (buttonPress) {
+          commandName = command.slice(1);
+          wantsPicker = PICKER_COMMANDS.has(commandName) || commandName === 'steer';
+        }
       }
       // Use the same access gate before reading catalogs, and again in accept
       // after selection. A visible picker never grants command permission.
@@ -1077,6 +1083,16 @@ export class DiscordRuntime {
         await api.editOriginalInteraction({ ...handle, content: '当前用户无权执行此命令。', signal });
         await bridge.accept(normalized, { accessDecision: access });
         return;
+      }
+      if (wantsHelp) {
+        try {
+          const panel = this.#commandPickers.issueHelp(normalized, this.#state.sessionFor(key));
+          await api.editOriginalInteraction({ ...handle, ...panel, signal });
+          return;
+        } catch {
+          // Preserve the ordinary text help through the same response target.
+          handle.content = '按钮面板暂不可用，显示文字帮助。';
+        }
       }
       if (wantsPicker) {
         let reason = '当前没有可选项，显示文字命令结果。';
