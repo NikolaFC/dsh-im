@@ -233,6 +233,13 @@ export class DiscordApi {
     });
   }
 
+  editOriginalInteraction({ applicationId, token, content, components = [], signal }) {
+    if (typeof token !== 'string' || !/^[A-Za-z0-9._-]+$/.test(token)) throw new TypeError('Invalid interaction token');
+    return this.#request(`webhooks/${snowflake(applicationId, 'application id')}/${token}/messages/@original`, {
+      method: 'PATCH', body: { content, components, allowed_mentions: { parse: [], replied_user: false } }, signal, timeoutMs: 10000,
+    });
+  }
+
   followupInteraction({ applicationId, token, content, signal }) {
     if (typeof token !== 'string' || !/^[A-Za-z0-9._-]+$/.test(token)) throw new TypeError('Invalid interaction token');
     return this.#request(`webhooks/${snowflake(applicationId, 'application id')}/${token}`, {

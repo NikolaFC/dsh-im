@@ -10,6 +10,7 @@ import { captureContextEnhancement } from '../shared/context-enhancement.mjs';
 import { evaluateInboundAccess } from '../shared/inbound-access.mjs';
 import { formatThinkingLine, formatToolTrace } from '../shared/thinking-trace.mjs';
 import { DiscordApi } from './discord-api.mjs';
+import { PICKER_COMMANDS, discordCommandChoices, DiscordCommandPickers, boundedDiscordContent } from './discord-command-picker.mjs';
 import { discordCardComponents, normalizeDiscordInteraction, syncDiscordCommands } from './discord-interactions.mjs';
 import { createDiscordBridgeStatus, DiscordHarnessBridge } from './discord-bridge.mjs';
 
@@ -462,6 +463,12 @@ export class DiscordBotClient {
   }
 
   async #sendText(target, text, markdown) {
+    if (target?.interactionResponse) {
+      const handle = target.interactionResponse;
+      handle.content = [handle.content, text].filter(Boolean).join('\n\n');
+      const result = await this.#api.editOriginalInteraction({ ...handle, content: boundedDiscordContent(handle.content), signal: this.#signal });
+      return { providerMessageIds: result?.id ? [result.id] : [] };
+    }
     const notice = !this.#deliveredNotices.has(target) && target?.notice
       ? String(target.notice) : null;
     const chunks = (markdown ? chunkMarkdownText : splitMessageText)(notice ? `${notice}\n\n${text}` : text, 1_900);
@@ -725,6 +732,7 @@ export class DiscordRuntime {
   #starting = null;
   #channels = new Map();
   #routing = new Map();
+  #commandPickers = new DiscordCommandPickers();
 
   constructor({
     config,
@@ -1038,6 +1046,56 @@ export class DiscordRuntime {
     const api = this.#api;
     const bridge = this.#bridge;
     if (!normalized || !api || !bridge) return;
+    const commandName = interaction.data?.name;
+    const pickerPress = interaction.type === 3 && normalized.data?.startsWith('dc1|');
+    const wantsPicker = interaction.type === 2 && (PICKER_COMMANDS.has(commandName) || commandName === 'steer')
+      && normalized.content === `/${commandName}`;
+    if (wantsPicker || pickerPress) {
+      const signal = this.#abortController?.signal;
+      await api.respondInteraction({ interactionId: interaction.id, token: interaction.token,
+        type: pickerPress ? 6 : 5, ...(pickerPress ? {} : { data: { flags: 64 } }), signal });
+      const handle = { applicationId: this.#config.platformId, token: interaction.token };
+      normalized.replyTarget.interactionResponse = handle;
+      const key = `${normalized.kind}:${normalized.conversationId}`;
+      if (pickerPress) {
+        // An unauthorized press must not retire the owner's still-live picker.
+        if (!this.#commandPickers.belongsTo(normalized)) return;
+        const command = this.#commandPickers.claim(normalized, this.#state.sessionFor(key));
+        if (!command) {
+          await api.editOriginalInteraction({ ...handle, content: '此选项已失效或不属于你，请重新执行命令。', signal });
+          return;
+        }
+        normalized.content = command;
+      }
+      // Use the same access gate before reading catalogs, and again in accept
+      // after selection. A visible picker never grants command permission.
+      const access = this.#accessPolicy ? evaluateInboundAccess(this.#accessPolicy, {
+        conversationType: normalized.kind, senderIds: [normalized.senderId], text: normalized.content,
+        hasImages: false, hasFiles: false,
+      }) : null;
+      if (access && !access.allowed) {
+        await api.editOriginalInteraction({ ...handle, content: '当前用户无权执行此命令。', signal });
+        await bridge.accept(normalized, { accessDecision: access });
+        return;
+      }
+      if (wantsPicker) {
+        let reason = '当前没有可选项，显示文字命令结果。';
+        if (commandName === 'steer') reason = '纠偏需要输入具体内容；请使用 /steer input:补充指令。普通消息也可按当前设置插话。';
+        else {
+          try {
+            const pickerSessionId = this.#state.sessionFor(key);
+            const choices = await discordCommandChoices(commandName, this.#harness, this.#state, key,
+              signal ? AbortSignal.any([signal, AbortSignal.timeout(10000)]) : AbortSignal.timeout(10000));
+            if (this.#state.sessionFor(key) !== pickerSessionId) throw new Error('Session binding changed');
+            const card = this.#commandPickers.issue(normalized, choices, pickerSessionId);
+            if (card) { await api.editOriginalInteraction({ ...handle, ...card, signal }); return; }
+          } catch { reason = '暂时无法读取选项，显示文字命令结果。'; }
+        }
+        handle.content = reason;
+        await api.editOriginalInteraction({ ...handle, content: reason, signal });
+      }
+      return bridge.accept(normalized);
+    }
     // ACK is the first I/O, before route lookup, access checks or Host work.
     await api.respondInteraction({ interactionId: interaction.id, token: interaction.token,
       type: interaction.type === 3 ? 6 : 4,
