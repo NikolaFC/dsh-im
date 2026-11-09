@@ -34,6 +34,7 @@ import {
   isPresetCommand,
   runPresetCommand,
 } from './preset-command.mjs';
+import { isPermissionCommand, runPermissionCommand } from './permission-command.mjs';
 import { askInWorkspaceSession } from './workspace-session.mjs';
 import { HarnessApprovalQueue, harnessApprovalDecision } from './harness-approval.mjs';
 import {
@@ -464,7 +465,9 @@ export class TextHarnessBridge {
       ? runControlCommand
       : (isModelCommand(text)
           ? runModelCommand
-          : (isPresetCommand(text) ? runPresetCommand : null));
+          : (isPermissionCommand(text)
+              ? runPermissionCommand
+              : (isPresetCommand(text) ? runPresetCommand : null)));
     if (commandRunner && (normalized.kind !== 'group' || normalized.addressed === true)) {
       let task;
       task = this.#processFastCommand(

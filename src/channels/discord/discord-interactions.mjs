@@ -8,7 +8,8 @@ const COMMANDS = [
   ['model', '查看或切换模型', true], ['reasoning', '查看或切换推理等级', true],
   ['reasoninglist', '列出推理等级', false], ['status', '查看会话状态', false],
   ['stop', '停止当前任务', false], ['new', '新建会话', true],
-  ['ws', '查看或切换工作区', true], ['steer', '纠偏当前任务', true],
+  ['ws', '查看或切换工作区', true],
+  ['permission', '查看或切换权限档位', true], ['steer', '纠偏当前任务', true],
   ['compact', '压缩当前会话', false], ['presets', '列出 Agent Preset', false],
   ['preset', '查看或切换 Agent Preset', true],
 ];
