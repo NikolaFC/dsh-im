@@ -30,6 +30,8 @@ import { deliverySwitchesOff } from '../../src/channels/shared/delivery-sync-set
 import { getDeliverySyncSettingsStore } from '../../src/channels/shared/delivery-sync-settings-store.mjs';
 import { installSessionTitlePrefix } from './session-title-prefix.mjs';
 import { installUpdateRpc } from './update-rpc.mjs';
+import { installDiscordThreadTool } from './discord-threads.mjs';
+import { installDiscordManagementTools } from './discord-management.mjs';
 
 export const name = 'dsh-im-host';
 export const inject = [
@@ -97,6 +99,8 @@ export function createImHostPlugin(internals = {}) {
     name,
     inject,
     async apply(ctx, config = {}) {
+      installDiscordThreadTool(ctx, config);
+      installDiscordManagementTools(ctx, config);
       const unavailableSessionSyncChannels = channels
         .map(([channel]) => channel)
         .filter((channel) => channel !== 'office'

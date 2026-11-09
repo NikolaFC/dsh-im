@@ -1912,19 +1912,27 @@ export class TextHarnessBridge {
     }
 
     const question = pending.questions[pending.index];
-    const parsed = this.#interactionCard?.parse?.(callback.data) ?? null;
-    const option = parsed && Array.isArray(question?.options)
-      ? question.options[parsed.optionIndex]
-      : undefined;
+    const parsed = this.#interactionCard?.parse?.(callback.data, callback) ?? null;
+    // Native select adapters may supply a complete set of indexes. Legacy
+    // button adapters retain their single optionIndex contract.
+    const indexes = parsed?.optionIndexes ?? [parsed?.optionIndex];
+    const selectedOptions = Array.isArray(indexes) && indexes.length > 0
+      && new Set(indexes).size === indexes.length
+      && indexes.every(index => Number.isInteger(index) && index >= 0
+        && typeof question?.options?.[index]?.label === 'string')
+      ? indexes.map(index => question.options[index]) : [];
+    const option = selectedOptions[0];
     if (!question || !parsed
+      || (parsed.optionIndexes && pending.cardMessageId
+        && callback.providerMessageId !== pending.cardMessageId)
       || !pending.cardNonce || parsed.nonce !== pending.cardNonce
       || parsed.questionIndex !== pending.index
-      || !option || typeof option.label !== 'string') {
+      || !option || typeof option.label !== 'string'
+      || (question.multiSelect !== true && selectedOptions.length !== 1)) {
       return notice(t('这个选项已失效，请使用最新一条问题。'));
     }
-    // Multi-select needs a keyboard that accumulates choices and a submit action;
-    // until that exists the request keeps the text answer it has always accepted.
-    if (question.multiSelect === true) {
+    // Only adapters returning a full validated selection opt into multi-select.
+    if (question.multiSelect === true && !parsed.optionIndexes) {
       return notice(t('多选问题请直接回复文字。'));
     }
 
@@ -1952,7 +1960,7 @@ export class TextHarnessBridge {
       // The press already identifies its option by index, so answer with that
       // exact label. Replaying the label as reply text would re-parse a numeric
       // label such as "2" as the second option and submit a different one.
-      { resolveAnswer: (current) => ({ id: current.id, selected: [option.label] }) },
+      { resolveAnswer: (current) => ({ id: current.id, selected: selectedOptions.map(item => item.label) }) },
     ).catch((error) => {
       this.#logger.error?.(
         `[dsh-im:${this.#descriptor.key}] failed to submit a card answer:`,

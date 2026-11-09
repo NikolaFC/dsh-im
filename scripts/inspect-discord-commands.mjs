@@ -1,0 +1,11 @@
+import fs from 'node:fs/promises';
+import {createRequire} from 'node:module';
+import {DiscordApi} from '../src/channels/discord/discord-api.mjs';
+const require=createRequire('C:/AI/DSH/cli/package.json');
+const yaml=require('yaml');
+const home=process.env.DSH_HOME ?? 'C:/Users/nikol/.dsh';
+const bot=JSON.parse(await fs.readFile(`${home}/integrations/dsh-discord/config.json`,'utf8')).bots[0];
+const token=yaml.parse(await fs.readFile(`${home}/.credentials.yaml`,'utf8')).refs[bot.tokenRef];
+const api=new DiscordApi({token});
+const commands=await api.listApplicationCommands({applicationId:bot.platformId,guildId:'1468696024829792310',signal:AbortSignal.timeout(15000)});
+console.log(JSON.stringify(commands.map(c=>({id:c.id,name:c.name,description:c.description})),null,2));

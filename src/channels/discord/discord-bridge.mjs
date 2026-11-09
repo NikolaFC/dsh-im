@@ -1,3 +1,4 @@
+import { DISCORD_INTERACTION_CARD, DiscordApprovalCard } from './discord-interactions.mjs';
 import { TextHarnessBridge, createTextBridgeStatus } from '../shared/text-harness-bridge.mjs';
 
 export const DISCORD_DESCRIPTOR = Object.freeze({
@@ -9,7 +10,8 @@ export const DISCORD_DESCRIPTOR = Object.freeze({
 
 export class DiscordHarnessBridge extends TextHarnessBridge {
   constructor(options) {
-    super({ descriptor: DISCORD_DESCRIPTOR, ...options });
+    super({ descriptor: DISCORD_DESCRIPTOR, interactionCard: DISCORD_INTERACTION_CARD,
+      approvalCard: new DiscordApprovalCard({ logger: options?.logger }), ...options });
   }
 }
 

@@ -10,6 +10,7 @@ import { captureContextEnhancement } from '../shared/context-enhancement.mjs';
 import { evaluateInboundAccess } from '../shared/inbound-access.mjs';
 import { formatThinkingLine, formatToolTrace } from '../shared/thinking-trace.mjs';
 import { DiscordApi } from './discord-api.mjs';
+import { discordCardComponents, normalizeDiscordInteraction, syncDiscordCommands } from './discord-interactions.mjs';
 import { createDiscordBridgeStatus, DiscordHarnessBridge } from './discord-bridge.mjs';
 
 const DISCORD_GATEWAY_INTENTS = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15);
@@ -478,6 +479,30 @@ export class DiscordBotClient {
     return { providerMessageIds };
   }
 
+  async sendInteractionCard(target, card) {
+    if (typeof card?.text !== 'string' || card.text.length > 1900) throw new TypeError('Discord card body is too long');
+    const message = await this.#api.createMessage({ channelId: target.channelId,
+      content: card.text, components: discordCardComponents(card.markup), signal: this.#signal });
+    return { providerMessageIds: [message.id] };
+  }
+
+  updateInteractionCard(target, messageId, card) {
+    return this.#api.editMessage({ channelId: target.channelId, messageId,
+      components: discordCardComponents(card.markup), signal: this.#signal });
+  }
+
+  editInteractionCard(target, messageId, card) {
+    if (card.text?.length > 2000) throw new TypeError('Discord card body is too long');
+    return this.#api.editMessage({ channelId: target.channelId, messageId,
+      content: card.text, components: discordCardComponents(card.markup), signal: this.#signal });
+  }
+
+  answerInteractionCallback(handle, text) {
+    // Gateway dispatch already acknowledged before invoking the shared bridge.
+    if (!text) return Promise.resolve();
+    return this.#api.followupInteraction({ ...handle, content: text, signal: this.#signal });
+  }
+
   sendTyping(target) {
     return this.#api.sendTyping({ channelId: target.channelId, signal: this.#signal });
   }
@@ -843,6 +868,15 @@ export class DiscordRuntime {
       } finally {
         clearTimeout(timer);
       }
+      // A missing command permission must not take the connected chat offline.
+      if (typeof api.listApplicationCommands === 'function') {
+        try {
+          this.#status.nativeCommands = await syncDiscordCommands(api, this.#config.platformId, controller.signal);
+        } catch (error) {
+          this.#logger.warn?.('[dsh-im:discord] native command registration failed:', error?.code ?? 'unavailable');
+          this.#status.nativeCommands = { error: error?.code ?? 'unavailable' };
+        }
+      }
       return this.status;
     } catch (error) {
       this.#status.ready = false;
@@ -949,6 +983,11 @@ export class DiscordRuntime {
           if (packet.d?.id) this.#channels.delete(String(packet.d.id));
         } else if (packet.t === 'THREAD_LIST_SYNC') {
           for (const channel of packet.d?.threads ?? []) this.#rememberChannel(channel);
+        } else if (packet.t === 'INTERACTION_CREATE') {
+          void this.#acceptInteraction(packet.d).catch((error) => {
+            // Never log interaction payloads or webhook-token URLs.
+            this.#logger.warn?.('[dsh-im:discord] interaction failed:', error?.code ?? 'unavailable');
+          });
         } else if (packet.t === 'MESSAGE_CREATE') {
           const bridge = this.#bridge;
           if (packet.d && bridge) {
@@ -992,6 +1031,22 @@ export class DiscordRuntime {
         this.#status.lastError = this.#status.error.message;
       });
     });
+  }
+
+  async #acceptInteraction(interaction) {
+    const normalized = normalizeDiscordInteraction(interaction, this.#config.platformId);
+    const api = this.#api;
+    const bridge = this.#bridge;
+    if (!normalized || !api || !bridge) return;
+    // ACK is the first I/O, before route lookup, access checks or Host work.
+    await api.respondInteraction({ interactionId: interaction.id, token: interaction.token,
+      type: interaction.type === 3 ? 6 : 4,
+      ...(interaction.type === 2 ? { data: { content: t('已收到操作，请查看下方结果。'), flags: 64 } } : {}),
+      signal: this.#abortController?.signal });
+    if (interaction.type === 3) return bridge.acceptCallback(normalized);
+    // Slash commands use the exact channel/thread binding and access policy of
+    // text commands, without creating a thread or pretending to be a message.
+    return bridge.accept(normalized);
   }
 
   #rememberChannel(channel) {

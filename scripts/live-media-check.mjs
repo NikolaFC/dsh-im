@@ -1,0 +1,15 @@
+import fs from 'node:fs/promises';
+import {createRequire} from 'node:module';
+import {DiscordApi} from '../src/channels/discord/discord-api.mjs';
+const require=createRequire('C:/AI/DSH/cli/package.json');
+const yaml=require('yaml');
+const home=process.env.DSH_HOME ?? 'C:/Users/nikol/.dsh';
+const bot=JSON.parse(await fs.readFile(`${home}/integrations/dsh-discord/config.json`,'utf8')).bots[0];
+const token=yaml.parse(await fs.readFile(`${home}/.credentials.yaml`,'utf8')).refs[bot.tokenRef];
+const api=new DiscordApi({token});
+const threadId='1569416570344710279';
+const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAJUlEQVR42mNkYPhfz0AEYBxVSF+FjIOhGkcVDgaFjIOhGkcVDgYFAJ0uC/1kF5nAAAAAAElFTkSuQmCC','base64');
+const started=Date.now();
+const sent=await api.createFileMessage({channelId:threadId,file:{fileName:'media-check.png',bytes:png,mediaType:'image/png',deliveryKey:'media-live-check-20261109'},signal:AbortSignal.timeout(60000)});
+const fetched=await api.getMessage({channelId:threadId,messageId:sent.id,signal:AbortSignal.timeout(15000)});
+console.log(JSON.stringify({messageId:fetched.id,elapsedMs:Date.now()-started,attachments:fetched.attachments.map(a=>({filename:a.filename,size:a.size,content_type:a.content_type,width:a.width,height:a.height})),flags:fetched.flags},null,2));
