@@ -1371,7 +1371,7 @@ test('Discord runtime keeps one isolated Session per managed thread and reuses i
     async markSeen(messageId) { seen.add(messageId); },
   };
   const createRuntime = () => new DiscordRuntime({
-    config: { botId: 'discord_test', platformId: botId, name: 'Harness Discord' },
+    config: { botId: 'discord_test', platformId: botId, mentionFree: false, thinkingTraces: false, name: 'Harness Discord' },
     token: TOKEN,
     harness,
     state,
@@ -1623,7 +1623,7 @@ test('Discord captures context settings before asynchronous Thread routing and u
   };
   let accessSettings = allowedAccessSettings;
   const runtime = new DiscordRuntime({
-    config: { botId: 'discord_internal', platformId: botId, name: 'Harness Discord' },
+    config: { botId: 'discord_internal', platformId: botId, mentionFree: false, thinkingTraces: false, name: 'Harness Discord' },
     token: TOKEN,
     contextEnhancement: {
       botId: 'discord_internal',
@@ -1740,7 +1740,7 @@ test('Discord runtime records one uncertain Thread result and suppresses Gateway
   let starts = 0;
   let socket;
   const runtime = new DiscordRuntime({
-    config: { botId: 'discord_test', platformId: botId, name: 'Harness Discord' },
+    config: { botId: 'discord_test', platformId: botId, mentionFree: false, thinkingTraces: false, name: 'Harness Discord' },
     token: TOKEN,
     harness: {
       ensureRunning: async () => true,
@@ -1833,6 +1833,8 @@ test('Discord runtime identifies on Gateway v10 and becomes ready', async () => 
       botId: 'discord_test',
       platformId: '1234567890123456789',
       name: 'Harness Discord',
+      mentionFree: false,
+      thinkingTraces: false,
     },
     token: TOKEN,
     harness: { ensureRunning: async () => true },
@@ -1936,7 +1938,7 @@ test('discord synced approval accepts the DM recipient, never the channel id as 
   const notices = [];
   const completion = new Promise(resolve => { finish = resolve; });
   const runtime = new DiscordRuntime({
-    config: { botId: 'discord_test', platformId: '1234567890123456789' }, token: TOKEN,
+    config: { botId: 'discord_test', platformId: '1234567890123456789', mentionFree: false, thinkingTraces: false }, token: TOKEN,
     harness: { ensureRunning: async () => true, ask: () => assert.fail('approval must not create a prompt') },
     state: { hasSeen: () => false, markSeen: async () => {}, sessionFor: () => null },
     createApi: () => ({ getCurrentUser: async () => ({ id: '1234567890123456789', bot: true }), getGatewayBot: async () => ({ url: 'wss://gateway.discord.gg' }), getChannel: async () => ({ type: 1, recipients: [{ id: '333333333333333333' }] }), createMessage: async r => { notices.push(r.content); return { id: '111111111111111900' }; } }),

@@ -24,10 +24,15 @@ export class DiscordConfigStore extends TokenBotConfigStore {
       channel: 'Discord',
       ...IDENTITY_OPTIONS,
       normalizeBotExtension(value) {
-        if (value.ownerUserId == null) return { ownerUserId: null };
+        // duoduo fork: both switches default ON; only an explicit false is stored.
+        const switches = {
+          ...(value.mentionFree === false ? { mentionFree: false } : {}),
+          ...(value.thinkingTraces === false ? { thinkingTraces: false } : {}),
+        };
+        if (value.ownerUserId == null) return { ownerUserId: null, ...switches };
         const ownerUserId = typeof value.ownerUserId === 'string' ? value.ownerUserId.trim() : '';
         if (!/^\d{5,30}$/.test(ownerUserId) || ownerUserId === value.platformId?.trim()) return null;
-        return { ownerUserId };
+        return { ownerUserId, ...switches };
       },
     });
   }
@@ -35,11 +40,14 @@ export class DiscordConfigStore extends TokenBotConfigStore {
   save(value) {
     // Shared credential binding rebuilds the base config. Preserve only this
     // bot's confirmed identity when omitted; explicit null still clears it.
+    const saved = this.get(value?.botId);
     return super.save({
       ...value,
       ownerUserId: value?.ownerUserId === undefined
-        ? this.get(value?.botId)?.ownerUserId ?? null
+        ? saved?.ownerUserId ?? null
         : value.ownerUserId,
+      mentionFree: value?.mentionFree === undefined ? saved?.mentionFree : value.mentionFree,
+      thinkingTraces: value?.thinkingTraces === undefined ? saved?.thinkingTraces : value.thinkingTraces,
     });
   }
 }

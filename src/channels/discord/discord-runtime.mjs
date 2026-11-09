@@ -8,6 +8,7 @@ import { fetchImageBuffer } from '../shared/image-prompt.mjs';
 import { t } from '../shared/i18n.mjs';
 import { captureContextEnhancement } from '../shared/context-enhancement.mjs';
 import { evaluateInboundAccess } from '../shared/inbound-access.mjs';
+import { formatThinkingLine, formatToolTrace } from '../shared/thinking-trace.mjs';
 import { DiscordApi } from './discord-api.mjs';
 import { createDiscordBridgeStatus, DiscordHarnessBridge } from './discord-bridge.mjs';
 
@@ -29,6 +30,16 @@ const IMAGE_FILE_TYPES = new Map([
   ['.gif', 'image/gif'],
 ]);
 const DISCORD_IMAGE_HOSTS = Object.freeze(['cdn.discordapp.com']);
+// duoduo fork: thinking-trace pages. One trace message is edited in place until
+// it nears Discord's 2000-character cap; edits are paced under the edit limit.
+const TRACE_PAGE_LIMIT = 1_900;
+const TRACE_EDIT_INTERVAL_MS = 1_200;
+
+/** Render one trace line as Discord subtext with its markdown neutralized. */
+export function discordTraceLine(line) {
+  const escaped = String(line).replace(/[\\*_~`|>#[\]()]/g, '\\$&').replace(/^-/, '\\-');
+  return `-# ${escaped}`;
+}
 
 function socketUrl(value) {
   const url = new URL(value);
@@ -101,6 +112,7 @@ function withConversationRoute(normalized, channel, botId, {
   fromSourceMessage = false,
   fallback = null,
   notice = null,
+  mentionFree = false,
 } = {}) {
   const channelId = String(channel?.id ?? normalized.conversationId);
   const thread = isThreadChannel(channel);
@@ -110,7 +122,7 @@ function withConversationRoute(normalized, channel, botId, {
     ...normalized,
     conversationId: channelId,
     addressed: normalized.addressed || managed,
-    requiresMention: thread ? !managed : normalized.kind === 'group',
+    requiresMention: mentionFree ? false : thread ? !managed : normalized.kind === 'group',
     replyTarget: {
       channelId,
       ...(!fromSourceMessage && normalized.replyTarget?.replyToMessageId
@@ -301,11 +313,12 @@ function discordReplyReference(message, loadReply) {
 export function normalizeDiscordMessage(message, botId, {
   fetchImpl = fetch,
   loadReply,
+  mentionFree = false,
 } = {}) {
   if (!message?.id || !message?.channel_id || !message?.author?.id
     || Number(message.type) === 21) return null;
   const direct = !message.guild_id;
-  const addressed = direct
+  const addressed = direct || mentionFree
     || message.mentions?.some((mention) => String(mention?.id) === String(botId));
   const replyTo = discordReplyReference(message, loadReply);
   return {
@@ -348,8 +361,10 @@ export async function resolveDiscordMessageRoute(message, botId, {
   fetchImpl = fetch,
   signal,
   onChannel,
+  mentionFree = false,
 } = {}) {
   const normalized = normalizeDiscordMessage(message, botId, {
+    mentionFree,
     fetchImpl,
     loadReply: typeof api?.getMessage === 'function'
       ? (options) => api.getMessage(options)
@@ -369,9 +384,12 @@ export async function resolveDiscordMessageRoute(message, botId, {
     signal,
   }), onChannel);
   if (isThreadChannel(sourceChannel)) {
-    return withConversationRoute(normalized, sourceChannel, botId);
+    return withConversationRoute(normalized, sourceChannel, botId, { mentionFree });
   }
-  if (!normalized.addressed) return withConversationRoute(normalized, sourceChannel, botId);
+  // duoduo fork: mention-free bots answer in place instead of opening a Thread.
+  if (!normalized.addressed || mentionFree) {
+    return withConversationRoute(normalized, sourceChannel, botId, { mentionFree });
+  }
 
   const sourceType = Number(sourceChannel?.type);
   if (sourceType !== GUILD_TEXT && sourceType !== GUILD_ANNOUNCEMENT) {
@@ -424,11 +442,13 @@ export async function resolveDiscordMessageRoute(message, botId, {
 export class DiscordBotClient {
   #api;
   #signal;
+  #logger;
   #deliveredNotices = new WeakSet();
 
-  constructor({ api, signal }) {
+  constructor({ api, signal, logger = console }) {
     this.#api = api;
     this.#signal = signal;
+    this.#logger = logger;
   }
 
   sendText(target, text) {
@@ -521,6 +541,114 @@ export class DiscordBotClient {
     return stream.start();
   }
 
+  /**
+   * duoduo fork: thinking-trace stream. Tool calls and reasoning lines are
+   * appended to one trace message that is edited in place (a new page once it
+   * fills up), so the channel keeps the think → act chain without a message
+   * per step. The answer is then delivered as its own normal message.
+   */
+  openThinkingStream(target) {
+    const client = this;
+    const api = this.#api;
+    const signal = this.#signal;
+    const logger = this.#logger;
+    const traceIds = [];
+    let page = { lines: [], id: null, sent: '' };
+    let firstPage = true;
+    let chain = Promise.resolve();
+    let timer = null;
+    let closed = false;
+    const clearTimer = () => {
+      if (timer === null) return;
+      clearTimeout(timer);
+      timer = null;
+    };
+    // Every write goes through one chain, so pages and edits land in order and
+    // a page's create always precedes its edits.
+    const sync = (current) => {
+      chain = chain.then(async () => {
+        const content = current.lines.join('\n');
+        if (!content || content === current.sent) return;
+        try {
+          if (current.id === null) {
+            const message = await api.createMessage({
+              channelId: target.channelId,
+              content,
+              replyToMessageId: current.reply ? target.replyToMessageId : undefined,
+              signal,
+            });
+            if (typeof message?.id === 'string' && message.id) {
+              current.id = message.id;
+              traceIds.push(message.id);
+            }
+          } else {
+            await api.editMessage({ channelId: target.channelId, messageId: current.id, content, signal });
+          }
+          current.sent = content;
+        } catch (error) {
+          logger?.warn?.('[dsh-im:discord] thinking trace delivery failed:', error);
+        }
+      });
+      return chain;
+    };
+    const append = (line) => {
+      if (closed || !line) return Promise.resolve();
+      const text = discordTraceLine(line);
+      if (page.lines.length > 0 && page.lines.join('\n').length + 1 + text.length > TRACE_PAGE_LIMIT) {
+        clearTimer();
+        void sync(page);
+        page = { lines: [], id: null, sent: '' };
+      }
+      if (page.lines.length === 0) {
+        page.reply = firstPage;
+        firstPage = false;
+      }
+      page.lines.push(text);
+      if (page.id === null && page.lines.length === 1) {
+        // The first line of a page shows up at once; later lines are paced.
+        void sync(page);
+      } else if (timer === null) {
+        const current = page;
+        timer = setTimeout(() => {
+          timer = null;
+          void sync(current);
+        }, TRACE_EDIT_INTERVAL_MS);
+        timer.unref?.();
+      }
+      return Promise.resolve();
+    };
+    return {
+      get messageId() {
+        return traceIds[0] ?? null;
+      },
+      get providerMessageIds() {
+        return [...traceIds];
+      },
+      presentation: 'discord-thinking',
+      // Long tool runs still want the typing indicator.
+      keepalive: true,
+      update: async () => {},
+      refresh: async () => {},
+      sendToolTrace: (name, argumentsValue) => append(formatToolTrace(name, argumentsValue)),
+      sendThinking: (text) => append(formatThinkingLine(text)),
+      async finish(answer) {
+        if (closed) throw new Error('Message stream is already closed');
+        closed = true;
+        clearTimer();
+        await sync(page);
+        const raw = answer && typeof answer === 'object' ? answer.text : answer;
+        const text = typeof raw === 'string' && raw.trim() ? raw : t('处理完成。');
+        const markdown = Boolean(answer && typeof answer === 'object' && answer.format === 'markdown');
+        const result = await client.#sendText(target, text, markdown);
+        return { presentation: 'discord-thinking', providerMessageIds: result.providerMessageIds };
+      },
+      cancel() {
+        closed = true;
+        clearTimer();
+      },
+    };
+  }
+
   #operationSignal(signal) {
     return signal ?? this.#signal;
   }
@@ -611,6 +739,11 @@ export class DiscordRuntime {
     return structuredClone(this.#status);
   }
 
+  /** duoduo fork: every message addresses the bot unless the config says otherwise. */
+  get #mentionFree() {
+    return this.#config?.mentionFree !== false;
+  }
+
   async sendConnectionTest(text) {
     if (!this.#status.ready || !this.#bridge) {
       const error = new Error('Discord bot is not connected');
@@ -685,7 +818,7 @@ export class DiscordRuntime {
         throw new Error('Discord token identity does not match the saved bot');
       }
       this.#gatewayUrl = gateway?.url;
-      const client = new DiscordBotClient({ api, signal: controller.signal });
+      const client = new DiscordBotClient({ api, signal: controller.signal, logger: this.#logger });
       this.#bridge = new DiscordHarnessBridge({
         bot: client,
         harness: this.#harness,
@@ -695,6 +828,8 @@ export class DiscordRuntime {
         status: this.#status,
         logger: this.#logger,
         replyTimeoutMs: this.#replyTimeoutMs,
+        // duoduo fork: default ON; an explicit false in the bot config opts out.
+        thinkingTraces: this.#config?.thinkingTraces !== false,
         signal: controller.signal,
       });
       let timer;
@@ -867,7 +1002,9 @@ export class DiscordRuntime {
   async #acceptMessage(message, bridge) {
     const messageId = String(message?.id ?? '');
     if (!messageId || this.#state.hasSeen(messageId)) return;
-    const preflight = normalizeDiscordMessage(message, this.#config.platformId);
+    const preflight = normalizeDiscordMessage(message, this.#config.platformId, {
+      mentionFree: this.#mentionFree,
+    });
     if (preflight) await captureGroupHistory(this.#groupHistory, preflight, groupHistoryEntry('discord', message, preflight, {
       groupName: this.#channels.get(String(message.channel_id))?.name,
     }), { logger: this.#logger });
@@ -900,6 +1037,7 @@ export class DiscordRuntime {
         channel: this.#channels.get(String(message.channel_id)),
         signal: this.#abortController?.signal,
         onChannel: (resolved) => this.#rememberChannel(resolved),
+        mentionFree: this.#mentionFree,
       });
       route = { pendingRoute, contextSnapshot, busyMessageMode };
       this.#routing.set(messageId, route);
