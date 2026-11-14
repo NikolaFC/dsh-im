@@ -2,6 +2,7 @@ import {
   accumulateFinalAssistantText,
   AssistantTextAccumulator,
   isDshImInputOrigin,
+  isDshImSteerInput,
   textFromHarnessContent,
 } from '../../src/channels/shared/harness-client.mjs';
 import {
@@ -10,7 +11,10 @@ import {
   withDeliverySyncIcon,
 } from '../../src/channels/shared/delivery-sync-settings.mjs';
 import { getDeliverySyncSettingsStore } from '../../src/channels/shared/delivery-sync-settings-store.mjs';
-import { deliverSessionSyncMirror } from '../../src/channels/shared/session-sync-registry.mjs';
+import {
+  deliverSessionSyncMirror,
+  liveSegmentsEnabled,
+} from '../../src/channels/shared/session-sync-registry.mjs';
 
 /**
  * Where the turn came from, as far as a chat mirror is concerned.
@@ -83,6 +87,7 @@ export function createSessionSyncCoordinator({
   deliveryService,
   logger = console,
   loadSettings = null,
+  liveSegments = liveSegmentsEnabled,
 } = {}) {
   if (typeof deliveryService?.deliverSessionText !== 'function') {
     throw new TypeError('Session sync requires a delivery service that can follow a Session binding');
@@ -220,8 +225,47 @@ export function createSessionSyncCoordinator({
     return deliverToBinding(sessionId, text, phase, format);
   };
 
+  // duoduo fork: a mid-turn text segment goes only to the chats whose bot
+  // opted in (registered live-segment bots); every other target keeps the old
+  // final-answer-only behaviour, so the segment reaches nobody new.
+  const deliverSegment = async (sessionId, text) => {
+    const targets = await deliveryService.listSessionSyncTargets?.(sessionId) ?? [];
+    if (targets.length > 0 || await botHasSavedTargets(sessionId)) {
+      const live = targets.filter((target) => liveSegments(target));
+      if (live.length === 0) return false;
+      return deliverToTargets(sessionId, live, text, 'assistant segment delivery', 'markdown');
+    }
+    let described = null;
+    try {
+      described = await deliveryService.describeConversation?.(sessionId) ?? null;
+    } catch {
+      described = null;
+    }
+    if (!described || !liveSegments(described)) return false;
+    return deliverToBinding(sessionId, text, 'assistant segment delivery', 'markdown');
+  };
+
+  // A step that wrote text and then called a tool is not the final answer;
+  // the accumulator drops it at the tool call, so posting it now never repeats.
+  const onAssistantSegment = async (sessionId, state, event) => {
+    const content = event.data?.message?.content;
+    if (!Array.isArray(content) || !content.some((part) => part?.type === 'tool-call')) return;
+    const text = textFromHarnessContent(content);
+    if (!text) return;
+    const deliverable = state.origin === TURN_INPUT_ORIGINS.web
+      || (state.origin === null && state.sawInternal === true);
+    if (!deliverable || state.echoFailed) return;
+    const settings = await readSettings(state);
+    if (!settings.deliverModelAnswers) return;
+    await deliverSegment(sessionId, withDeliverySyncIcon(settings.modelIcon, text));
+  };
+
   const onUserMessage = async (sessionId, state, event, originHint) => {
     if (event.surfaceOp !== 'append') return;
+    // duoduo fork: a chat steering into a turn it did not open (a goal round)
+    // is already visible in that chat and does not answer the turn, so it
+    // neither claims the turn nor gets echoed.
+    if (originHint === 'im-steer') return;
     const origin = classifyTurnInput(event.data?.source, { imOwned: originHint === 'im' });
     // Only a message that says where the reader was may own the turn. A service
     // injection — the runtime context the Host prepends, a reminder, a notice —
@@ -314,6 +358,7 @@ export function createSessionSyncCoordinator({
       if (event.data?.interrupted === true) return;
       if (event.data?.turn !== undefined && event.data.turn !== state.turn) return;
       accumulateFinalAssistantText(state.assistant, event);
+      if (event.type === 'assistant/message') await onAssistantSegment(sessionId, state, event);
       return;
     }
 
@@ -361,11 +406,18 @@ export function isImOwnedInput(scope, event) {
   return isDshImInputOrigin(scope, source.rpcId);
 }
 
+/** duoduo fork: whether that same registered input was a steer, not a prompt. */
+export function isImSteerInput(scope, event) {
+  const rpcId = event?.data?.source?.rpcId;
+  return typeof rpcId === 'string' && rpcId !== '' && isDshImSteerInput(scope, rpcId);
+}
+
 export function installSessionSyncCoordinator(ctx, deliveryService, {
   logger = console,
   inputScope = ctx?.root ?? ctx,
   loadSettings = null,
   imInputOwnership = isImOwnedInput,
+  imSteerInput = isImSteerInput,
   config = {},
 } = {}) {
   if (typeof ctx?.on !== 'function') {
@@ -386,7 +438,7 @@ export function installSessionSyncCoordinator(ctx, deliveryService, {
     // claiming the id; the coordinator classifies the rest of the turn, and a
     // message's origin is read from that same message, never from the turn.
     const origin = event?.type === 'user/message' && imInputOwnership(inputScope, event)
-      ? 'im'
+      ? (imSteerInput(inputScope, event) ? 'im-steer' : 'im')
       : 'other';
     void coordinator.enqueue(sessionId, event, origin);
   }, { global: true });

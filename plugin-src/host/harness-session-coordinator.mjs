@@ -49,6 +49,53 @@ function currentOwnedTurn(agent, expectedTurn, promptRpcId) {
   return openTurn === expectedTurn && owned;
 }
 
+// A retained route credential may steer only an uninterrupted sequence of
+// goal-driver turns following its exact prompt. Ordinary/manual turns break
+// the chain. Inspect and inject in the same tick; no history-read race or wake.
+function currentGoalContinuation(agent, anchorTurn, promptRpcId) {
+  if (agent?.status !== 'running' || !Number.isSafeInteger(anchorTurn)) return false;
+  const events = typeof agent?.session?.snapshotEvents === 'function'
+    ? agent.session.snapshotEvents() : agent?.session?.events;
+  if (!Array.isArray(events)) return false;
+  let turn = null;
+  let anchored = false;
+  let firstInput = false;
+  let goalTurn = false;
+  let goalId = null;
+  for (const event of events) {
+    if (event?.type === 'turn/start') {
+      // An unclosed or input-less continuation is not proven lineage.
+      if (anchored && turn !== null) return false;
+      turn = event.data?.turn ?? null;
+      firstInput = false;
+      goalTurn = false;
+    } else if (event?.type === 'user/message') {
+      const source = event.data?.source;
+      // Host-authored context shares the event type with inbox messages.
+      if (['runtime-context', 'time-context', 'model-selection', 'plugin:dsh-im'].includes(source?.kind)
+        && ['snapshot', 'notice'].includes(source?.form)) continue;
+      if (source?.kind === 'skill-catalog' && source?.form === 'catalog') continue;
+      if (turn === anchorTurn && source?.rpcId === promptRpcId) anchored = true;
+      if (anchored && turn !== anchorTurn && !firstInput) {
+        if (source?.kind !== 'goal' || typeof source.goalId !== 'string' || !source.goalId
+          || (goalId !== null && goalId !== source.goalId)) return false;
+        goalId = source.goalId;
+        goalTurn = true;
+      }
+      firstInput = true;
+    } else if (event?.type === 'turn/end' && event.data?.turn === turn) {
+      if (anchored) {
+        const reason = event.data?.reason?.kind ?? event.data?.reason;
+        if (reason && reason !== 'completed') return false;
+        if (turn !== anchorTurn && !goalTurn) return false;
+      }
+      turn = null;
+      goalTurn = false;
+    }
+  }
+  return anchored && turn !== null && turn > anchorTurn && goalTurn;
+}
+
 function deepFreeze(value) {
   if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
   for (const child of Object.values(value)) deepFreeze(child);
@@ -70,13 +117,31 @@ function agentBusyError(cause) {
   return error;
 }
 
+function currentOpenTurn(agent) {
+  if (agent?.status !== 'running') return false;
+  const events = typeof agent.session?.snapshotEvents === 'function'
+    ? agent.session.snapshotEvents() : agent.session?.events;
+  if (!Array.isArray(events)) return false;
+  let turn = null;
+  for (const event of events) {
+    if (event.type === 'turn/start') turn = event.data?.turn ?? null;
+    if (event.type === 'turn/end' && event.data?.turn === turn) turn = null;
+  }
+  return turn !== null;
+}
+
 function createControlExecutor(agents) {
-  return ({ sessionId, expectedTurn, promptRpcId, inputRpcId, action, text }) => {
+  return ({ sessionId, expectedTurn, promptRpcId, continuationAfterTurn, boundSession, inputRpcId, action, text }) => {
     const agent = agents.get(sessionId);
     // An unattached Session cannot be coordinated in-process. Let the client
     // retain its legacy HTTP path for deployments where attachment is lazy.
-    if (!agent) return undefined;
-    if (!currentOwnedTurn(agent, expectedTurn, promptRpcId)) return false;
+    if (boundSession !== undefined) {
+      if (typeof boundSession !== 'function' || boundSession(sessionId) !== true) return false;
+      if (!agent || agents.get(sessionId) !== agent || !currentOpenTurn(agent)) return false;
+    } else if (!agent) return undefined;
+    else if (continuationAfterTurn !== undefined) {
+      if (action !== 'steer' || !currentGoalContinuation(agent, continuationAfterTurn, promptRpcId)) return false;
+    } else if (!currentOwnedTurn(agent, expectedTurn, promptRpcId)) return false;
 
     if (action === 'stop') {
       agent.cancel({ kind: 'user' }, { keepInbox: true });

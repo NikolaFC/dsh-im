@@ -38,7 +38,8 @@ test('help panel bounds and one-shot buttons share picker identity discipline', 
   const owner = { senderId: 'owner', kind: 'group', conversationId: 'channel' };
   const panel = registry.issueHelp(owner, 's');
   const buttons = panel.components.flatMap(row => row.components);
-  assert.equal(buttons.length, 13);
+  assert.equal(buttons.length, 14);
+  assert.ok(buttons.some(button => button.custom_id.startsWith('dbtn|goal|')));
   assert.ok(panel.components.every(row => row.components.length <= 5));
   assert.ok(buttons.every(button => button.type === 2 && button.custom_id.startsWith('dbtn|')));
   const press = { ...owner, componentType: 2, data: buttons.find(button => button.custom_id.startsWith('dbtn|model|')).custom_id };

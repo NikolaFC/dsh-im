@@ -24,10 +24,11 @@ export class DiscordConfigStore extends TokenBotConfigStore {
       channel: 'Discord',
       ...IDENTITY_OPTIONS,
       normalizeBotExtension(value) {
-        // duoduo fork: both switches default ON; only an explicit false is stored.
+        // duoduo fork: every switch defaults ON; only an explicit false is stored.
         const switches = {
           ...(value.mentionFree === false ? { mentionFree: false } : {}),
           ...(value.thinkingTraces === false ? { thinkingTraces: false } : {}),
+          ...(value.liveText === false ? { liveText: false } : {}),
         };
         if (value.ownerUserId == null) return { ownerUserId: null, ...switches };
         const ownerUserId = typeof value.ownerUserId === 'string' ? value.ownerUserId.trim() : '';
@@ -48,6 +49,7 @@ export class DiscordConfigStore extends TokenBotConfigStore {
         : value.ownerUserId,
       mentionFree: value?.mentionFree === undefined ? saved?.mentionFree : value.mentionFree,
       thinkingTraces: value?.thinkingTraces === undefined ? saved?.thinkingTraces : value.thinkingTraces,
+      liveText: value?.liveText === undefined ? saved?.liveText : value.liveText,
     });
   }
 }

@@ -15,6 +15,8 @@ import {
   createOutboundArtifactTool,
   outboundArtifactRegistry,
 } from '../../../src/channels/shared/semantic/artifact.mjs';
+import { ConversationStateStore } from '../../../src/channels/shared/conversation-state-store.mjs';
+import { createHarnessSessionExecutors } from '../../../plugin-src/host/harness-session-coordinator.mjs';
 import { WORKSPACE_SESSION_STALE } from '../../../src/channels/shared/workspace-session.mjs';
 import { setImHostLanguage } from '../../../src/channels/shared/i18n.mjs';
 import { classifyMessageFailure } from '../../../src/channels/shared/message-failure.mjs';
@@ -733,6 +735,90 @@ test('steer refuses a turn that ended during its ownership refresh', async () =>
     method === 'session.prompt' && payload.mode === 'steer'
   )), false);
   assert.equal(await asking, 'already complete');
+});
+
+test('steer follows a completed route into goal continuation without replaying its prompt', async () => {
+  const injected = [];
+  const agent = { status: 'running', session: { events: [] }, inject: message => injected.push(message) };
+  let attached = agent;
+  const { controlExecutor } = createHarnessSessionExecutors({ get: () => ({ get: () => attached }) });
+  const turn = controlledTurn({ controlExecutor });
+  const control = { owner: {}, key: 'group:game' };
+  const asking = turn.client.ask(turn.id, 'play', { control, timeoutMs: 2_000 });
+  await turn.admitted;
+  // Let the ask observe its prompt and finish, removing active ownership.
+  assert.equal(await turn.client.hasActiveTurn(turn.id, control), true);
+  turn.finish({ text: 'continuing', reason: 'completed' });
+  await asking;
+  agent.session.events = [
+    { type: 'turn/start', data: { turn: 7 } },
+    { type: 'user/message', data: { source: { kind: 'user', rpcId: turn.promptRpcId() } } },
+    { type: 'turn/end', data: { turn: 7 } },
+    { type: 'turn/start', data: { turn: 8 } },
+    { type: 'user/message', data: { source: { kind: 'goal', goalId: 'goal-game', round: 1 } } },
+  ];
+  for (const [sessionId, wrong] of [
+    [turn.id, { owner: {}, key: control.key }],
+    [turn.id, { owner: control.owner, key: 'group:other' }],
+    ['other-session', control],
+  ]) {
+    const before = turn.calls.length;
+    assert.equal(await turn.client.steerActiveTurn(sessionId, 'not authorized', wrong), false);
+    assert.equal(turn.calls.length, before);
+  }
+  assert.equal(await turn.client.steerActiveTurn(turn.id, 'take a screenshot', control), true);
+  assert.equal(injected.length, 1);
+  assert.equal(injected[0].content[0].text, 'take a screenshot');
+  attached = undefined;
+  assert.equal(await turn.client.steerActiveTurn(turn.id, 'cold session must not wake', control), false);
+  attached = agent;
+  agent.session.events.push({ type: 'turn/end', data: { turn: 8 } },
+    { type: 'turn/start', data: { turn: 9 } },
+    { type: 'user/message', data: { source: { kind: 'user', rpcId: 'manual' } } });
+  assert.equal(await turn.client.steerActiveTurn(turn.id, 'moved turn', control), false);
+  assert.equal(injected.length, 1);
+  assert.equal(turn.calls.filter(call => call.method === 'session.prompt').length, 1,
+    'the original prompt must never be resubmitted and no queue RPC is allowed');
+});
+
+test('new client restores only a persisted exact-route goal anchor after reload', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-im-reload-control-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'bot-state.json');
+  const state = await new ConversationStateStore(path).load();
+  const injected = [];
+  const agent = { status: 'running', session: { events: [] }, inject: message => injected.push(message) };
+  const { controlExecutor } = createHarnessSessionExecutors({ get: () => ({ get: () => agent }) });
+  const turn = controlledTurn({ controlExecutor });
+  await state.setSession('group:game', turn.id);
+  const control = { owner: {}, key: 'group:game',
+    readAnchor: () => state.controlAnchorFor('group:game', 'discord'),
+    saveAnchor: anchor => state.rememberControlAnchor('group:game', { ...anchor, channel: 'discord' }),
+  };
+  const asking = turn.client.ask(turn.id, 'play', { control, timeoutMs: 2_000 });
+  await turn.admitted;
+  turn.finish({ text: 'done', reason: 'completed' });
+  await asking;
+  const restored = await new ConversationStateStore(path).load();
+  const anchor = restored.controlAnchorFor('group:game', 'discord');
+  assert.equal(anchor?.promptRpcId, turn.promptRpcId());
+  agent.session.events = [
+    { type: 'turn/start', data: { turn: 7 } },
+    { type: 'user/message', data: { source: { kind: 'user', rpcId: anchor.promptRpcId } } },
+    { type: 'turn/end', data: { turn: 7 } },
+    { type: 'turn/start', data: { turn: 8 } },
+    { type: 'user/message', data: { source: { kind: 'runtime-context', form: 'snapshot' } } },
+    { type: 'user/message', data: { source: { kind: 'goal', goalId: 'goal-game', round: 1 } } },
+  ];
+  const client = new HarnessClient({ baseUrl: 'http://127.0.0.1:3982', controlExecutor });
+  client.rpc = () => { throw new Error('restored steering must not use HTTP'); };
+  const recovered = { owner: {}, key: 'group:game',
+    readAnchor: () => restored.controlAnchorFor('group:game', 'discord') };
+  assert.equal(await client.steerActiveTurn(turn.id, 'after restart', recovered), true);
+  await restored.setSession('group:game', 'elsewhere');
+  await restored.setSession('group:game', turn.id);
+  assert.equal(await client.steerActiveTurn(turn.id, 'after rebind', recovered), false);
+  assert.equal(injected.length, 1);
 });
 
 function scopedHarnessFixture() {

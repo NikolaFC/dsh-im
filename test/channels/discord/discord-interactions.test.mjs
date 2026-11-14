@@ -19,6 +19,10 @@ test('slash normalizer preserves channel/actor and only accepts known bounded co
   assert.equal(message.conversationId, event.channel_id);
   assert.equal(message.senderId, event.member.user.id);
   assert.equal(message.replyTarget.replyToMessageId, undefined);
+  const direct = normalizeDiscordInteraction({ ...event, guild_id: undefined, member: undefined,
+    user: { id: event.member.user.id } }, app);
+  assert.equal(direct.kind, 'direct');
+  assert.equal(direct.content, '/model provider/model');
   assert.equal(normalizeDiscordInteraction({ ...event, application_id: 'other' }, app), null);
   assert.equal(normalizeDiscordInteraction({ ...event, guild_id: 'other' }, app), null);
   assert.equal(discordCommandText({ type: 1, name: 'approve' }), null);
@@ -32,14 +36,54 @@ test('command registration never overwrites unrelated commands including collisi
     { type: 1, id: '3', name: 'model', description: 'DSH · old' },
     { type: 1, id: '4', name: 'unrelated', description: 'leave me' }];
   const result = await syncDiscordCommands({
-    listApplicationCommands: async () => existing,
+    listApplicationCommands: async args => args.guildId === DISCORD_COMMAND_GUILD ? existing : [],
     createApplicationCommand: async args => calls.push(['create', args]),
     editApplicationCommand: async args => calls.push(['edit', args]),
   }, app);
   assert.deepEqual(result.collisions, ['help']);
   assert.deepEqual(result.updated, ['model']);
-  assert.ok(calls.every(([, args]) => args.guildId === DISCORD_COMMAND_GUILD));
-  assert.ok(calls.every(([, args]) => !['help', 'models', 'unrelated'].includes(args.command.name)));
+  const guildCalls = calls.filter(([, args]) => args.guildId === DISCORD_COMMAND_GUILD);
+  assert.ok(guildCalls.length > 0);
+  assert.ok(guildCalls.every(([, args]) => !['help', 'models', 'unrelated'].includes(args.command.name)));
+});
+
+test('command registration adds bot-DM-only global commands alongside the guild commands', async () => {
+  const reads = [];
+  const writes = [];
+  const result = await syncDiscordCommands({
+    listApplicationCommands: async args => { reads.push(args); return []; },
+    createApplicationCommand: async args => writes.push(args),
+    editApplicationCommand: async () => assert.fail('empty command directories must not edit'),
+  }, app);
+  assert.deepEqual(new Set(reads.map(args => args.guildId ?? 'global')), new Set([DISCORD_COMMAND_GUILD, 'global']));
+  const globalWrites = writes.filter(args => args.guildId === undefined);
+  const guildWrites = writes.filter(args => args.guildId === DISCORD_COMMAND_GUILD);
+  assert.equal(globalWrites.length, DISCORD_APPLICATION_COMMANDS.length);
+  assert.equal(guildWrites.length, DISCORD_APPLICATION_COMMANDS.length);
+  assert.ok(globalWrites.every(args => args.command.contexts?.length === 1 && args.command.contexts[0] === 1));
+  assert.ok(globalWrites.every(args => JSON.stringify(args.command.integration_types) === '[0]'));
+  assert.equal(result.global.created.length, DISCORD_APPLICATION_COMMANDS.length);
+  assert.equal(result.guild.created.length, DISCORD_APPLICATION_COMMANDS.length);
+});
+
+test('command readbacks with default required=false omitted do not trigger repeat updates', async () => {
+  const withoutRequired = options => options?.map(({ required, ...option }) => option);
+  const guild = DISCORD_APPLICATION_COMMANDS.map((command, index) => ({
+    ...command, id: `guild-${index}`, options: withoutRequired(command.options),
+  }));
+  const global = DISCORD_APPLICATION_COMMANDS.map((command, index) => ({
+    ...command, id: `global-${index}`, options: withoutRequired(command.options), contexts: [1], integration_types: [0],
+  }));
+  const writes = [];
+  const result = await syncDiscordCommands({
+    listApplicationCommands: async args => args.guildId === DISCORD_COMMAND_GUILD ? guild : global,
+    createApplicationCommand: async args => writes.push(args),
+    editApplicationCommand: async args => writes.push(args),
+  }, app);
+  assert.deepEqual(result.created, []);
+  assert.deepEqual(result.updated, []);
+  assert.deepEqual(result.collisions, []);
+  assert.deepEqual(writes, []);
 });
 
 test('native multi select is bounded and has exact index identity', () => {
@@ -137,6 +181,24 @@ test('application command creation honors a definite 429 rejection once', async 
     await api.createApplicationCommand({ applicationId: app, guildId: DISCORD_COMMAND_GUILD, command: DISCORD_APPLICATION_COMMANDS[0] });
     assert.equal(attempts, 2);
   } finally { clearInterval(keep); }
+});
+
+test('application command API supports the global endpoint used by bot DMs', async () => {
+  const paths = [];
+  const api = new DiscordApi({ token: `${'a'.repeat(24)}.${'b'.repeat(6)}.${'c'.repeat(28)}`,
+    fetchImpl: async (url, options) => {
+      paths.push({ path: url.pathname, method: options.method });
+      return Response.json(options.method === 'GET' ? [] : { id: '555555555555555555' });
+    } });
+  const command = DISCORD_APPLICATION_COMMANDS[0];
+  await api.listApplicationCommands({ applicationId: app });
+  await api.createApplicationCommand({ applicationId: app, command });
+  await api.editApplicationCommand({ applicationId: app, commandId: '555555555555555555', command });
+  assert.deepEqual(paths, [
+    { path: `/api/v10/applications/${app}/commands`, method: 'GET' },
+    { path: `/api/v10/applications/${app}/commands`, method: 'POST' },
+    { path: `/api/v10/applications/${app}/commands/555555555555555555`, method: 'PATCH' },
+  ]);
 });
 
 test('API callback uses bounded HTTP acknowledgment; card edits clear components', async () => {

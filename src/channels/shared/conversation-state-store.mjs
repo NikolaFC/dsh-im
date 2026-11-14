@@ -47,6 +47,12 @@ function normalizeAuthors(value) {
   return authors;
 }
 
+function normalizeControlAnchor(value) {
+  if (!value || !['channel', 'sessionId', 'promptRpcId'].every(key => typeof value[key] === 'string' && value[key])
+    || !Number.isSafeInteger(value.turn) || value.turn < 0) return null;
+  return { channel: value.channel, sessionId: value.sessionId, turn: value.turn, promptRpcId: value.promptRpcId };
+}
+
 const EMPTY_STATE = Object.freeze({ version: 1, sessions: {}, seenMessageIds: [], cursor: null });
 
 /**
@@ -102,6 +108,11 @@ function normalizeState(value) {
       }
     }
   }
+  const controlAnchors = {};
+  for (const [key, value_] of Object.entries(value.controlAnchors ?? {})) {
+    const anchor = normalizeControlAnchor(value_);
+    if (anchor && sessions[key] === anchor.sessionId) controlAnchors[key] = anchor;
+  }
   // An empty queue leaves no key behind, so an untouched state file keeps the
   // shape earlier versions wrote.
   const pendingMessages = normalizePendingMessages(value.pendingMessages);
@@ -111,6 +122,7 @@ function normalizeState(value) {
   const normalized = {
     version: 1,
     sessions,
+    ...(Object.keys(controlAnchors).length ? { controlAnchors } : {}),
     ...(Object.keys(authors).length ? { authors } : {}),
     ...(pendingMessages.length ? { pendingMessages } : {}),
     ...(value.deferred ? { deferred: normalizeDeferredState(value.deferred) } : {}),
@@ -131,6 +143,7 @@ export class ConversationStateStore {
   #path;
   #state = structuredClone(EMPTY_STATE);
   #writeQueue = Promise.resolve();
+  #bindingVersions = new Map();
   #deferred = deferredStateAccess(() => this.#state, () => this.#persist());
 
   constructor(path) {
@@ -226,17 +239,45 @@ export class ConversationStateStore {
     return structuredClone(author);
   }
 
+  // The state file is bot-scoped; the key includes the native channel/thread.
+  // Credentials are written by the Host after observing its admitted prompt,
+  // never inferred from message text, a session binding or an rpcId prefix.
+  controlAnchorFor(key, channel) {
+    const anchor = this.#state.controlAnchors?.[key];
+    return anchor?.channel === channel && this.sessionFor(key) === anchor.sessionId
+      ? structuredClone(anchor) : null;
+  }
+
+  controlBindingVersion(key) { return this.#bindingVersions.get(key) ?? 0; }
+
+  async rememberControlAnchor(key, value, bindingVersion = this.controlBindingVersion(key)) {
+    const anchor = normalizeControlAnchor(value);
+    if (!anchor || bindingVersion !== this.controlBindingVersion(key)
+      || this.sessionFor(key) !== anchor.sessionId) return false;
+    (this.#state.controlAnchors ??= {})[key] = anchor;
+    await this.#persist();
+    return true;
+  }
+
   async setSession(key, sessionId) {
+    if (this.sessionFor(key) !== sessionId) {
+      this.#bindingVersions.set(key, this.controlBindingVersion(key) + 1);
+      if (this.#state.controlAnchors) delete this.#state.controlAnchors[key];
+    }
     this.#state.sessions[key] = sessionId;
     await this.#persist();
   }
 
   async clearSession(key) {
+    this.#bindingVersions.set(key, this.controlBindingVersion(key) + 1);
+    if (this.#state.controlAnchors) delete this.#state.controlAnchors[key];
     delete this.#state.sessions[key];
     await this.#persist();
   }
 
   async clearSessions() {
+    for (const key of Object.keys(this.#state.sessions)) this.#bindingVersions.set(key, this.controlBindingVersion(key) + 1);
+    delete this.#state.controlAnchors;
     this.#state.sessions = {};
     await this.#persist();
   }

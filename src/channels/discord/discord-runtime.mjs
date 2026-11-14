@@ -9,6 +9,7 @@ import { t } from '../shared/i18n.mjs';
 import { captureContextEnhancement } from '../shared/context-enhancement.mjs';
 import { evaluateInboundAccess } from '../shared/inbound-access.mjs';
 import { formatThinkingLine, formatToolTrace } from '../shared/thinking-trace.mjs';
+import { registerLiveSegmentBot } from '../shared/session-sync-registry.mjs';
 import { DiscordApi } from './discord-api.mjs';
 import { PICKER_COMMANDS, discordCommandChoices, DiscordCommandPickers, boundedDiscordContent } from './discord-command-picker.mjs';
 import { discordCardComponents, normalizeDiscordInteraction, syncDiscordCommands } from './discord-interactions.mjs';
@@ -447,7 +448,11 @@ export class DiscordBotClient {
   #logger;
   #deliveredNotices = new WeakSet();
 
-  constructor({ api, signal, logger = console }) {
+  #typing = new Map();
+  #now;
+
+  constructor({ api, signal, logger = console, now = Date.now }) {
+    this.#now = now;
     this.#api = api;
     this.#signal = signal;
     this.#logger = logger;
@@ -510,8 +515,22 @@ export class DiscordBotClient {
     return this.#api.followupInteraction({ ...handle, content: text, signal: this.#signal });
   }
 
-  sendTyping(target) {
-    return this.#api.sendTyping({ channelId: target.channelId, signal: this.#signal });
+  // Both producers remain active. The transport owns the shared rate/in-flight
+  // gate, so a broken or unloaded observer can never disable turn typing.
+  sendTyping(target) { return this.sendActivityTyping(target); }
+
+  sendActivityTyping(target) {
+    const channelId = target.channelId;
+    const at = this.#now();
+    const previous = this.#typing.get(channelId);
+    if (previous?.pending || at - (previous?.at ?? -Infinity) < 7_500) return Promise.resolve({ sent: false, lastPulseAt: previous.at });
+    for (const [id, row] of this.#typing) if (!row.pending && at - row.at >= 7_500) this.#typing.delete(id);
+    const row = { at, pending: true };
+    this.#typing.set(channelId, row);
+    const timeout = AbortSignal.timeout(5_000);
+    const signal = this.#signal ? AbortSignal.any([this.#signal, timeout]) : timeout;
+    return Promise.resolve().then(() => this.#api.sendTyping({ channelId, signal }))
+      .then(() => ({ sent: true, lastPulseAt: at })).finally(() => { row.pending = false; });
   }
 
   sendFile(target, file) {
@@ -585,6 +604,7 @@ export class DiscordBotClient {
     const signal = this.#signal;
     const logger = this.#logger;
     const traceIds = [];
+    const segmentIds = [];
     let page = { lines: [], id: null, sent: '' };
     let firstPage = true;
     let chain = Promise.resolve();
@@ -654,7 +674,7 @@ export class DiscordBotClient {
         return traceIds[0] ?? null;
       },
       get providerMessageIds() {
-        return [...traceIds];
+        return [...traceIds, ...segmentIds];
       },
       presentation: 'discord-thinking',
       // Long tool runs still want the typing indicator.
@@ -663,11 +683,38 @@ export class DiscordBotClient {
       refresh: async () => {},
       sendToolTrace: (name, argumentsValue) => append(formatToolTrace(name, argumentsValue)),
       sendThinking: (text) => append(formatThinkingLine(text)),
+      /**
+       * Post one finished mid-turn text segment as a normal message, in order
+       * with the trace: pending trace lines land first, and later lines open
+       * a new trace page below the segment instead of editing one above it.
+       */
+      sendSegment(answer) {
+        if (closed) return Promise.reject(new Error('Message stream is already closed'));
+        const raw = answer && typeof answer === 'object' ? answer.text : answer;
+        if (typeof raw !== 'string' || !raw.trim()) return Promise.resolve({ providerMessageIds: [] });
+        const markdown = Boolean(answer && typeof answer === 'object' && answer.format === 'markdown');
+        clearTimer();
+        const current = page;
+        void sync(current);
+        if (current.lines.length > 0) page = { lines: [], id: null, sent: '' };
+        // The first message of a turn anchors it to the user's message.
+        const segmentTarget = {
+          channelId: target.channelId,
+          replyToMessageId: firstPage ? target.replyToMessageId : undefined,
+        };
+        firstPage = false;
+        const sent = chain.then(() => client.#sendText(segmentTarget, raw, markdown));
+        chain = sent.then((result) => { segmentIds.push(...result.providerMessageIds); }, () => undefined);
+        return sent;
+      },
       async finish(answer) {
         if (closed) throw new Error('Message stream is already closed');
         closed = true;
         clearTimer();
         await sync(page);
+        if (answer && typeof answer === 'object' && answer.liveSegmentsOnly === true && segmentIds.length > 0) {
+          return { presentation: 'discord-thinking', providerMessageIds: [] };
+        }
         const raw = answer && typeof answer === 'object' ? answer.text : answer;
         const text = typeof raw === 'string' && raw.trim() ? raw : t('处理完成。');
         const markdown = Boolean(answer && typeof answer === 'object' && answer.format === 'markdown');
@@ -733,6 +780,9 @@ export class DiscordRuntime {
   #channels = new Map();
   #routing = new Map();
   #commandPickers = new DiscordCommandPickers();
+  #observeActivity;
+  #stopActivity = null;
+  #stopLiveSegments = null;
 
   constructor({
     config,
@@ -748,6 +798,7 @@ export class DiscordRuntime {
     createApi = (options) => new DiscordApi(options),
     createWebSocket = (url) => new WebSocket(url),
     random = Math.random,
+    observeActivity,
   }) {
     if (!config || !token || !harness || !state) {
       throw new TypeError('DiscordRuntime requires config, token, Harness, and state');
@@ -766,6 +817,7 @@ export class DiscordRuntime {
     this.#createApi = createApi;
     this.#createWebSocket = createWebSocket;
     this.#random = random;
+    this.#observeActivity = observeActivity;
   }
 
   get status() {
@@ -863,8 +915,14 @@ export class DiscordRuntime {
         replyTimeoutMs: this.#replyTimeoutMs,
         // duoduo fork: default ON; an explicit false in the bot config opts out.
         thinkingTraces: this.#config?.thinkingTraces !== false,
+        // duoduo fork: mid-turn text goes out per step; same opt-out rule.
+        liveText: this.#config?.liveText !== false,
         signal: controller.signal,
       });
+      // Goal rounds reach this bot through Session sync; opt them in as well.
+      if (this.#config?.liveText !== false && this.#config?.botId) {
+        this.#stopLiveSegments = registerLiveSegmentBot({ channel: 'discord', botId: this.#config.botId });
+      }
       let timer;
       try {
         await Promise.race([
@@ -875,6 +933,19 @@ export class DiscordRuntime {
         ]);
       } finally {
         clearTimeout(timer);
+      }
+      if (this.#observeActivity) {
+        try {
+          this.#stopActivity = this.#observeActivity({
+            state: this.#state,
+            sendTyping: (target) => this.#status.ready
+              ? client.sendActivityTyping(target) : Promise.resolve(),
+            signal: controller.signal,
+            logger: this.#logger,
+          });
+        } catch {
+          this.#logger.warn?.('[dsh-im:discord] activity lifecycle unavailable; retaining turn typing');
+        }
       }
       // A missing command permission must not take the connected chat offline.
       if (typeof api.listApplicationCommands === 'function') {
@@ -1103,7 +1174,7 @@ export class DiscordRuntime {
             const choices = await discordCommandChoices(commandName, this.#harness, this.#state, key,
               signal ? AbortSignal.any([signal, AbortSignal.timeout(10000)]) : AbortSignal.timeout(10000));
             if (this.#state.sessionFor(key) !== pickerSessionId) throw new Error('Session binding changed');
-            const card = this.#commandPickers.issue(normalized, choices, pickerSessionId);
+            const card = this.#commandPickers.issue(normalized, choices.choices ?? choices, pickerSessionId, choices.content);
             if (card) { await api.editOriginalInteraction({ ...handle, ...card, signal }); return; }
           } catch { reason = '暂时无法读取选项，显示文字命令结果。'; }
         }
@@ -1247,6 +1318,10 @@ export class DiscordRuntime {
 
   async stop() {
     this.#stopped = true;
+    this.#stopActivity?.();
+    this.#stopActivity = null;
+    this.#stopLiveSegments?.();
+    this.#stopLiveSegments = null;
     this.#generation += 1;
     this.#abortController?.abort();
     this.#abortController = null;

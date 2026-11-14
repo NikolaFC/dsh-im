@@ -88,6 +88,12 @@ function snowflake(value, name) {
   return id;
 }
 
+function applicationCommandPath({ applicationId, guildId, commandId }) {
+  const guildPath = guildId === undefined ? '' : `/guilds/${snowflake(guildId, 'guild id')}`;
+  const commandPath = commandId === undefined ? '' : `/${snowflake(commandId, 'command id')}`;
+  return `applications/${snowflake(applicationId, 'application id')}${guildPath}/commands${commandPath}`;
+}
+
 function threadName(value) {
   const name = cleanString(value);
   if (!name || [...name].length > 100) {
@@ -214,15 +220,15 @@ export class DiscordApi {
   }
 
   listApplicationCommands({ applicationId, guildId, signal }) {
-    return this.#request(`applications/${snowflake(applicationId, 'application id')}/guilds/${snowflake(guildId, 'guild id')}/commands`, { method: 'GET', signal });
+    return this.#request(applicationCommandPath({ applicationId, guildId }), { method: 'GET', signal });
   }
 
   createApplicationCommand({ applicationId, guildId, command, signal }) {
-    return this.#request(`applications/${snowflake(applicationId, 'application id')}/guilds/${snowflake(guildId, 'guild id')}/commands`, { method: 'POST', body: command, signal });
+    return this.#request(applicationCommandPath({ applicationId, guildId }), { method: 'POST', body: command, signal });
   }
 
   editApplicationCommand({ applicationId, guildId, commandId, command, signal }) {
-    return this.#request(`applications/${snowflake(applicationId, 'application id')}/guilds/${snowflake(guildId, 'guild id')}/commands/${snowflake(commandId, 'command id')}`, { method: 'PATCH', body: command, signal });
+    return this.#request(applicationCommandPath({ applicationId, guildId, commandId }), { method: 'PATCH', body: command, signal });
   }
 
   respondInteraction({ interactionId, token, type, data, signal }) {

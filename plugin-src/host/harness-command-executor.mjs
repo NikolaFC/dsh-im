@@ -1,4 +1,6 @@
 import { harnessPeer } from './harness-peer.mjs';
+import { isGoalCommand } from '../../src/channels/shared/goal-command.mjs';
+import { executeHarnessGoalCommand } from './harness-goal-command.mjs';
 
 /**
  * Adapt the Host's Typert command gateway to the channel Harness client.
@@ -16,6 +18,7 @@ export function createHarnessCommandExecutor(ctx, provided) {
   }
   const peer = harnessPeer(ctx);
   return async (sessionId, line, options = {}) => {
+    if (isGoalCommand(line)) return executeHarnessGoalCommand(gateway, peer, sessionId, line, options);
     const request = {
       namespace: 'commands',
       method: 'execute',

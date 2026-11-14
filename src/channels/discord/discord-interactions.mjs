@@ -17,14 +17,25 @@ export const DISCORD_APPLICATION_COMMANDS = COMMANDS.map(([name, description, ar
   type: 1, name, description: `DSH · ${description}`,
   ...(args ? { options: [{ type: 3, name: 'input', description: '命令参数（与文字命令相同）', required: false, max_length: 1000 }] } : {}),
 }));
+DISCORD_APPLICATION_COMMANDS.push({ type: 1, name: 'goal', description: 'DSH · 查看或管理当前会话目标', options: [
+  { type: 3, name: 'action', description: '选择目标操作（留空显示状态和选项）', required: false,
+    choices: [{ name: '查看状态', value: 'status' }, { name: '创建目标', value: 'create' },
+      { name: '暂停自动续轮', value: 'pause' }, { name: '恢复自动续轮', value: 'resume' }] },
+  { type: 3, name: 'objective', description: '创建时必填：具体完成目标', required: false, max_length: 1000 },
+  { type: 4, name: 'rounds', description: '创建时的自动续轮上限（默认 256）', required: false, min_value: 1, max_value: 256 },
+] });
 
-/** Upsert only this adapter's guild commands; never bulk overwrite or delete. */
-export async function syncDiscordCommands(api, applicationId, signal) {
-  const scope = { applicationId, guildId: DISCORD_COMMAND_GUILD, signal };
+function comparableDiscordOptions(options) {
+  // Discord omits required=false in readbacks because false is the API default.
+  return JSON.stringify(options ?? [], (key, value) => key === 'required' && value === false ? undefined : value);
+}
+
+/** Upsert only this adapter's commands in one scope; never bulk overwrite or delete. */
+async function syncDiscordCommandScope(api, scope, commands) {
   const existing = await api.listApplicationCommands(scope);
   if (!Array.isArray(existing)) throw new TypeError('Invalid Discord command directory');
   const result = { created: [], updated: [], collisions: [] };
-  for (const command of DISCORD_APPLICATION_COMMANDS) {
+  for (const command of commands) {
     const prior = existing.find(item => item.type === 1 && item.name === command.name);
     if (prior && !prior.description?.startsWith('DSH · ')) {
       result.collisions.push(command.name);
@@ -34,7 +45,10 @@ export async function syncDiscordCommands(api, applicationId, signal) {
       await api.createApplicationCommand({ ...scope, command });
       result.created.push(command.name);
     } else if (prior.description !== command.description
-      || JSON.stringify(prior.options ?? []) !== JSON.stringify(command.options ?? [])) {
+      || comparableDiscordOptions(prior.options) !== comparableDiscordOptions(command.options)
+      || (command.contexts !== undefined && JSON.stringify(prior.contexts ?? null) !== JSON.stringify(command.contexts))
+      || (command.integration_types !== undefined
+        && JSON.stringify(prior.integration_types ?? null) !== JSON.stringify(command.integration_types))) {
       await api.editApplicationCommand({ ...scope, commandId: prior.id, command });
       result.updated.push(command.name);
     }
@@ -42,10 +56,46 @@ export async function syncDiscordCommands(api, applicationId, signal) {
   return result;
 }
 
+/**
+ * Guild commands serve Satoshi Capital. Separate global commands are restricted
+ * to the bot's own DMs, so they neither duplicate guild commands nor appear in
+ * unrelated servers or user-installed private channels.
+ */
+export async function syncDiscordCommands(api, applicationId, signal) {
+  const guild = await syncDiscordCommandScope(api,
+    { applicationId, guildId: DISCORD_COMMAND_GUILD, signal }, DISCORD_APPLICATION_COMMANDS);
+  const directCommands = DISCORD_APPLICATION_COMMANDS.map(command => ({
+    ...command, contexts: [1], integration_types: [0],
+  }));
+  const global = await syncDiscordCommandScope(api, { applicationId, signal }, directCommands);
+  return {
+    created: [...new Set([...guild.created, ...global.created])],
+    updated: [...new Set([...guild.updated, ...global.updated])],
+    collisions: [...new Set([...guild.collisions, ...global.collisions])],
+    guild,
+    global,
+  };
+}
+
 export function discordCommandText(data) {
   const definition = DISCORD_APPLICATION_COMMANDS.find(item => item.name === data?.name);
   if (!definition || data.type !== 1) return null;
   const options = data.options ?? [];
+  if (definition.name === 'goal') {
+    if (!Array.isArray(options) || options.length > 3 || new Set(options.map(item => item.name)).size !== options.length) return null;
+    const values = {};
+    for (const item of options) {
+      if (item.name === 'action' && item.type === 3 && ['status', 'create', 'pause', 'resume'].includes(item.value)) values.action = item.value;
+      else if (item.name === 'objective' && item.type === 3 && typeof item.value === 'string'
+        && item.value.trim() && item.value.length <= 1000 && !/[\r\n\0]/u.test(item.value)) values.objective = item.value.trim();
+      else if (item.name === 'rounds' && item.type === 4 && Number.isSafeInteger(item.value) && item.value >= 1 && item.value <= 256) values.rounds = item.value;
+      else return null;
+    }
+    if (values.action !== 'create' && (values.objective !== undefined || values.rounds !== undefined)) return null;
+    if (values.action === 'create') return values.objective
+      ? `/goal create --rounds ${values.rounds ?? 256} ${values.objective}` : '/goal create';
+    return `/goal${values.action ? ` ${values.action}` : ''}`;
+  }
   if (!Array.isArray(options) || options.length > 1) return null;
   const input = options[0];
   if (input && (!definition.options || input.name !== 'input' || input.type !== 3

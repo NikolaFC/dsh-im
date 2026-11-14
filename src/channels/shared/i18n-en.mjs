@@ -1,3 +1,4 @@
+import goal from './i18n-en/goal.mjs';
 import imageInput from './i18n-en/image-input.mjs';
 import permission from './i18n-en/permission.mjs';
 import diagnostics from './i18n-en/diagnostics.mjs';
@@ -26,6 +27,7 @@ import email from './i18n-en/email.mjs';
 export const EN = Object.freeze(Object.assign(
   {},
   diagnostics,
+  goal,
   imageInput,
   permission,
   sharedA,

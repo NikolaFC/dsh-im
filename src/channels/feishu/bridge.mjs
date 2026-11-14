@@ -49,6 +49,7 @@ import {
 import { runCompactCommand } from '../shared/compact-command.mjs';
 import { isClearCommand, runClearCommand } from '../shared/clear-command.mjs';
 import { isHistoryCommand, runHistoryCommand } from '../shared/history-command.mjs';
+import { isGoalCommand, runGoalCommand } from '../shared/goal-command.mjs';
 import {
   isControlCommand,
   runControlCommand,
@@ -1382,6 +1383,7 @@ export class FeishuHarnessBridge {
       return processing;
     }
     const commandRunner = isHistoryCommand(commandText) ? runHistoryCommand
+      : isGoalCommand(commandText) ? runGoalCommand
       : isPermissionCommand(commandText) ? runPermissionCommand
       : hasInboundFiles(commandMessage) ? null : isControlCommand(commandText)
       ? runControlCommand

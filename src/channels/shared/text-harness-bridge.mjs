@@ -1,4 +1,5 @@
 import { BusyMessageDispatcher, canAutomaticallySteer } from './busy-message-dispatcher.mjs';
+import { createBoundConversationControl } from './bound-conversation-control.mjs';
 import { randomBytes, randomUUID } from 'node:crypto';
 
 import { createDeferredDeliveryCoordinator, deferredOutcomeText } from './deferred-delivery-coordinator.mjs';
@@ -16,6 +17,7 @@ import {
 import { runWorkspaceCommand, workspaceSwitchFailureText } from './workspace-command.mjs';
 import { runStatusCommand } from './status-command.mjs';
 import { runCompactCommand } from './compact-command.mjs';
+import { isGoalCommand, runGoalCommand } from './goal-command.mjs';
 import { isClearCommand, runClearCommand } from './clear-command.mjs';
 import { isHistoryCommand, runHistoryCommand } from './history-command.mjs';
 import {
@@ -193,6 +195,7 @@ export class TextHarnessBridge {
   #contextEnhancement;
   #accessPolicy;
   #thinkingTraces;
+  #liveText;
   #status;
   #logger;
   #replyTimeoutMs;
@@ -240,6 +243,7 @@ export class TextHarnessBridge {
     contextEnhancement,
     accessPolicy,
     thinkingTraces = false,
+    liveText = false,
     status = createTextBridgeStatus(),
     logger = console,
     replyTimeoutMs = 600_000,
@@ -264,6 +268,9 @@ export class TextHarnessBridge {
     this.#contextEnhancement = contextEnhancement;
     this.#accessPolicy = accessPolicy;
     this.#thinkingTraces = thinkingTraces;
+    // duoduo fork: post each mid-turn text segment as soon as its step ends.
+    // Needs a thinking stream that can place a segment between trace pages.
+    this.#liveText = liveText === true;
     this.#status = status;
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
@@ -461,6 +468,7 @@ export class TextHarnessBridge {
       && this.#batches.status(key).phase === 'collecting';
     const commandRunner = collectingBatch ? null : isClearCommand(text) ? runClearCommand
       : isHistoryCommand(text) ? runHistoryCommand
+      : isGoalCommand(text) ? runGoalCommand
       : hasInboundFiles(normalized) ? null : isControlCommand(text)
       ? runControlCommand
       : (isModelCommand(text)
@@ -586,7 +594,7 @@ export class TextHarnessBridge {
           && canAutomaticallySteer(this.#accessPolicy, normalized.kind,
             [senderId, normalized.senderAlternateId].filter(Boolean)),
         harness: this.#harness, state: this.#state, status: this.#status,
-        signal: this.#signal, control: { owner: this, key }, logger: this.#logger,
+        signal: this.#signal, control: this.#turnControl(key, normalized), logger: this.#logger,
         acceptedMessageIds: this.#acceptedMessageIds,
         pendingInteraction: () => this.#pendingInteractions.has(key) || this.#approvals.hasPending(key),
         enhancement: {
@@ -619,6 +627,20 @@ export class TextHarnessBridge {
    * the lanes, so a channel can fall through to richer routing (busy-mode steering
    * and queue receipts) for what these lanes decline.
    */
+  #turnControl(key, message) {
+    const boundSession = createBoundConversationControl({ channel: this.#descriptor.key,
+      state: this.#state, key, message, accessPolicy: this.#accessPolicy, signal: this.#signal });
+    const durable = typeof this.#state.controlAnchorFor === 'function'
+      && typeof this.#state.rememberControlAnchor === 'function';
+    return { owner: this, key, ...(boundSession ? { boundSession } : {}), ...(durable ? {
+      readAnchor: () => this.#state.controlAnchorFor(key, this.#descriptor.key),
+      captureAnchorWriter: () => {
+        const version = this.#state.controlBindingVersion?.(key);
+        return anchor => this.#state.rememberControlAnchor(key, { ...anchor, channel: this.#descriptor.key }, version);
+      },
+    } : {}) };
+  }
+
   #dispatchTrigger(message, messageId, senderId, key, { exit } = {}) {
     const toQueue = (options) => (exit
       ? exit(options)
@@ -634,7 +656,7 @@ export class TextHarnessBridge {
       const sessionId = this.#state.sessionFor?.(key) ?? null;
       if (text && sessionId !== null && typeof this.#harness.steerActiveTurn === 'function') {
         return this.#harness
-          .steerActiveTurn(sessionId, text, { owner: this, key }, this.#signal ? { signal: this.#signal } : undefined)
+          .steerActiveTurn(sessionId, text, this.#turnControl(key, message), this.#signal ? { signal: this.#signal } : undefined)
           .then((steered) => (steered
             ? this.#settleSteeredTurn(author, messageId, key)
             : toQueue()))
@@ -990,7 +1012,7 @@ export class TextHarnessBridge {
           hasFiles: hasInboundFiles(message),
           pendingInteraction: this.#pendingInteractions.has(key)
             || this.#approvals.hasPending(key),
-          control: { owner: this, key },
+          control: this.#turnControl(key, message),
           deferredDelivery: this.#deferred,
           enhancement: captureContextEnhancementSource(
             this.#contextEnhancement,
@@ -1025,6 +1047,10 @@ export class TextHarnessBridge {
         return;
       }
       message.statusReaction?.error();
+      if (error?.code === 'im-control-denied') {
+        await this.#bot.sendText(target, t(COMMAND_PERMISSION_DENIED_MESSAGE));
+        return;
+      }
       this.#status.lastError = error?.message ?? String(error);
       const failure = setLastMessageFailure(this.#status, error);
       this.#logger.error?.(
@@ -1229,6 +1255,26 @@ export class TextHarnessBridge {
       const thinkingMode = Boolean(stream
         && this.#thinkingTraces
         && typeof stream.sendToolTrace === 'function');
+      // duoduo fork: live segments. A step's text is held until the step is
+      // known not to be the final answer (it called a tool, or a later step
+      // began), then posted at once; ask() leaves posted steps out of the
+      // turn-end answer, so nothing is sent twice. Held per turn only.
+      const liveSteps = thinkingMode && this.#liveText && typeof stream.sendSegment === 'function'
+        ? new Set() : null;
+      const heldSegments = new Map();
+      const flushSegments = async (isDone) => {
+        for (const [step, held] of [...heldSegments].sort(([left], [right]) => left - right)) {
+          if (!isDone(step, held)) continue;
+          heldSegments.delete(step);
+          try {
+            await stream.sendSegment(createTextDeliveryBlock(held.text, 'markdown'));
+            liveSteps.add(step);
+          } catch (error) {
+            // Not marked as posted, so the turn-end answer still carries it.
+            this.#logger.warn?.(`[dsh-im:${this.#descriptor.key}] live text segment failed; keeping it for the final answer:`, error?.message ?? error);
+          }
+        }
+      };
       // What the model sees. A message may carry two texts: `controlText`, the
       // plain body the parsers read, and `content`, the same body decorated for
       // the model — the email channel prefixes the mail headers there, so a
@@ -1346,21 +1392,33 @@ export class TextHarnessBridge {
           groupHistory: message.groupHistory,
           timeoutMs: this.#replyTimeoutMs,
           signal: this.#signal,
-          control: { owner: this, key: conversationKey },
+          control: this.#turnControl(conversationKey, message),
           // Thinking mode needs every update (reasoning + tool calls) in
           // order; latest mode filters as before. Only thinking mode subscribes
           // to reasoning updates, so default-mode consumers on other channels
           // never see them (their progress handlers would render update.text).
           progressMode: thinkingMode ? 'all' : undefined,
           reasoning: thinkingMode,
+          ...(liveSteps ? { liveDeliveredSteps: liveSteps } : {}),
           onUpdate: stream ? async (update) => {
             if (thinkingMode) {
               // Only the 💭 and 🔧 lines are surfaced; status/text updates
               // and the assistant-message canonical text are not.
               if (update.type === 'reasoning') {
                 await stream.sendThinking(update.text);
+                // 💭 → text → 🔧: a tool step's text follows its own reasoning.
+                if (liveSteps && Number.isSafeInteger(update.step)) {
+                  await flushSegments((step, held) => step < update.step
+                    || (step === update.step && held.toolCalls));
+                }
               } else if (update.type === 'tool') {
+                // Any step followed by a tool call is not the final answer.
+                if (liveSteps) await flushSegments(() => true);
                 await stream.sendToolTrace(update.name, update.arguments);
+              } else if (liveSteps && update.type === 'assistant-message'
+                && Number.isSafeInteger(update.step) && cleanText(update.text)) {
+                await flushSegments((step) => step < update.step);
+                heldSegments.set(update.step, { text: update.text, toolCalls: update.toolCalls === true });
               }
               return;
             }
@@ -1419,11 +1477,16 @@ export class TextHarnessBridge {
       // What the channel observed about the send itself; it is written to the
       // log together with the reference id the user is shown.
       let deliveryEvidence = null;
+      // Every word of this turn already went out as live segments: the stream
+      // only closes its trace instead of posting a placeholder answer.
+      const liveSegmentsOnly = Boolean(liveSteps?.size > 0 && !cleanText(visibleAnswer));
       if (stream) {
         try {
-          const result = await stream.finish(semanticStream || thinkingStream
-            ? createTextDeliveryBlock(visibleAnswer, answerFormat)
-            : visibleAnswer);
+          const result = await stream.finish(liveSegmentsOnly
+            ? { liveSegmentsOnly: true }
+            : semanticStream || thinkingStream
+              ? createTextDeliveryBlock(visibleAnswer, answerFormat)
+              : visibleAnswer);
           streamFinished = true;
           deliveryEvidence = result?.deliveryEvidence ?? deliveryEvidence;
           textReceipt = createDeliveryReceipt({
@@ -1446,7 +1509,7 @@ export class TextHarnessBridge {
           );
         }
       }
-      if (!streamFinished) {
+      if (!streamFinished && !liveSegmentsOnly) {
         try {
           const answerTarget = this.#turnDeliveryTarget(target, conversationKey);
           const result = typeof this.#bot.sendDelivery === 'function'

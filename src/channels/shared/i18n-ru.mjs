@@ -4,6 +4,7 @@
 // ./i18n-en.mjs, never from the Chinese identity key (see t() in ./i18n.mjs).
 // Entries are maintained per area in ./i18n-ru/*.mjs and merged here.
 
+import goal from './i18n-ru/goal.mjs';
 import diagnostics from './i18n-ru/diagnostics.mjs';
 import imageInput from './i18n-ru/image-input.mjs';
 import permission from './i18n-ru/permission.mjs';
@@ -27,6 +28,7 @@ import email from './i18n-ru/email.mjs';
 export const RU = Object.freeze(Object.assign(
   {},
   diagnostics,
+  goal,
   imageInput,
   permission,
   sharedA,

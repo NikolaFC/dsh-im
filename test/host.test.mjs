@@ -313,7 +313,10 @@ test('Host waits for modern Harness Controllers', async () => {
       },
     };
     await plugin.apply(ctx, {});
-    assert.deepEqual(injections[0], expected);
+    // The Host may inject earlier dependencies (Discord thread/management tools)
+    // before the controllers; what matters is that channel activation waits for
+    // the modern controllers to be present.
+    assert.deepEqual(injections.find((deps) => deps.includes('sessionController')), expected);
     assert.deepEqual(calls, CHANNELS.map(([channel]) => channel));
   }
 });

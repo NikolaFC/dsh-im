@@ -1,7 +1,9 @@
 import { randomBytes } from 'node:crypto';
 import { workspacePathSnapshot } from '../shared/workspace-command.mjs';
+import { GOAL_CREATE_HINT, runGoalCommand } from '../shared/goal-command.mjs';
+import { t } from '../shared/i18n.mjs';
 
-export const PICKER_COMMANDS = new Set(['model', 'reasoning', 'permission', 'preset', 'ws', 'workspace']);
+export const PICKER_COMMANDS = new Set(['model', 'reasoning', 'permission', 'preset', 'ws', 'workspace', 'goal']);
 const idArg = value => /^\d+$/.test(value) ? `id:${value}` : value;
 const safeArg = value => typeof value === 'string' && value.length > 0 && !/[\r\n\0]/.test(value);
 export const boundedDiscordContent = text => text.length <= 2000 ? text : `${text.slice(0, 1960)}\n…（结果较长，已截断）`;
@@ -9,6 +11,24 @@ export const boundedDiscordContent = text => text.length <= 2000 ? text : `${tex
 /** Read the same scoped Host catalogs as the text commands; never mutate them. */
 export async function discordCommandChoices(command, harness, state, key, signal) {
   const options = { signal };
+  if (command === 'goal') {
+    const status = await runGoalCommand('/goal status', harness, state, key, options);
+    const goal = status?.goal;
+    const bound = typeof state?.sessionFor === 'function' && Boolean(state.sessionFor(key));
+    const choices = [{ label: '查看目标状态', command: '/goal status' }];
+    if (!goal || goal.phase === 'complete') choices.push({ label: '创建目标（填写说明）', command: '/goal create' });
+    if (goal?.phase === 'active') choices.push({ label: '暂停自动续轮', command: '/goal pause' });
+    if (goal && goal.phase !== 'complete' && goal.roundsStarted < goal.maxGoalRounds
+      && (goal.phase !== 'active' || goal.activation !== 'armed')) choices.push({ label: '恢复自动续轮', command: '/goal resume' });
+    // A fresh conversation has no Session yet; saying how to create the goal is
+    // more useful than leaving the unbound notice as the only instruction.
+    return {
+      content: bound
+        ? status.message
+        : `${status.message}\n\n${t(GOAL_CREATE_HINT)}`,
+      choices,
+    };
+  }
   if (command === 'preset') {
     const settings = await harness.agentPresetSettings(options);
     return (settings.agentPresetCatalog?.items ?? []).map(item => ({ label: item.label || item.id, command: `/preset ${idArg(item.id)}` }));
@@ -39,12 +59,12 @@ export async function discordCommandChoices(command, harness, state, key, signal
 export const DISCORD_HELP_BUTTONS = Object.freeze([
   ['status', '状态'], ['models', '模型列表'], ['model', '切换模型'], ['reasoning', '推理等级'],
   ['reasoninglist', '等级列表'], ['permission', '权限'], ['preset', '切换预设'], ['presets', '预设列表'],
-  ['ws', '工作区'], ['steer', '补充指令'], ['compact', '压缩上下文'], ['new', '新会话'], ['stop', '停止'],
+  ['ws', '工作区'], ['goal', '会话目标'], ['steer', '补充指令'], ['compact', '压缩上下文'], ['new', '新会话'], ['stop', '停止'],
 ]);
 
 export class DiscordCommandPickers {
   #entries = new Map();
-  issue(message, choices, sessionId) {
+  issue(message, choices, sessionId, summary) {
     const clean = choices.filter(item => safeArg(item?.label) && safeArg(item?.command));
     if (!clean.length) return null;
     const nonce = randomBytes(12).toString('base64url');
@@ -54,7 +74,7 @@ export class DiscordCommandPickers {
     while (this.#entries.size >= 256) this.#entries.delete(this.#entries.keys().next().value);
     this.#entries.set(nonce, { actor: message.senderId, route: `${message.kind}:${message.conversationId}`, sessionId,
       expires: now + 10 * 60_000, items, claimed: false });
-    return { content: `选一个：${clean.length > 25 ? `（仅显示前 25 项，共 ${clean.length} 项；其他选项请用文字命令）` : ''}`,
+    return { content: summary ? boundedDiscordContent(summary) : `选一个：${clean.length > 25 ? `（仅显示前 25 项，共 ${clean.length} 项；其他选项请用文字命令）` : ''}`,
       components: [{ type: 1, components: [{ type: 3, custom_id: `dc1|${nonce}`, min_values: 1, max_values: 1,
         options: items.map((item, index) => ({ label: item.label.slice(0, 100), value: String(index) })) }] }] };
   }

@@ -435,6 +435,34 @@ for (const finalText of ['Answer', '']) {
 }
 }
 
+for (const finalText of ['Answer', '']) {
+  test(`ask leaves live-posted steps out of the answer (empty=${!finalText})`, async () => {
+    const host = hostFixture();
+    host.onPrompt = (rpcId) => {
+      const events = [
+        { type: 'turn/start', data: { turn: 1 } },
+        { type: 'user/message', data: { turn: 1, source: { rpcId } } },
+        { type: 'assistant/message', data: { turn: 1, step: 0, message: { content: [{ type: 'text', text: 'Checking' }, { type: 'tool-call', name: 'bash' }] } } },
+        { type: 'tool/call', data: { turn: 1, step: 0, name: 'bash' } },
+        { type: 'assistant/message', data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: finalText }] } } },
+        { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+      ];
+      events.forEach((event, seq) => host.append({ ...event, seq }));
+    };
+    const liveDeliveredSteps = new Set();
+    const answer = await localClient(host.apiProxy).ask('session', 'hello', {
+      progressMode: 'all',
+      liveDeliveredSteps,
+      onUpdate: (update) => {
+        if (update.type === 'assistant-message' && update.toolCalls === true) liveDeliveredSteps.add(update.step);
+      },
+      onInteraction: () => {}, timeoutMs: 1000,
+    });
+    assert.deepEqual([...liveDeliveredSteps], [0]);
+    assert.equal(answer, finalText, 'a posted step is never repeated, and an all-posted turn answers empty');
+  });
+}
+
 test('live ask consumes transient reasoning from mux even when history never retains it', async () => {
   const host = hostFixture();
   const updates = [];

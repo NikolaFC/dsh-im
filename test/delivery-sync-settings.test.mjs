@@ -111,7 +111,9 @@ test('the store writes the document atomically and reads it back', async (t) => 
       modelIcon: '',
     },
   });
-  assert.equal((await stat(path)).mode & 0o777, 0o600);
+  // Windows does not carry POSIX mode bits, so the 0600 intent cannot be read
+  // back there; the atomic write itself is checked above on every platform.
+  if (process.platform !== 'win32') assert.equal((await stat(path)).mode & 0o777, 0o600);
 
   // A later save keeps the fields it did not touch.
   await store.set({ modelIcon: '🤖' });

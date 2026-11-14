@@ -93,6 +93,10 @@ export const SHARED_COMMAND_CATALOG = Object.freeze([
     '纯数字 ID：/preset id:<ID>',
     '/preset --default  跟随 Host 默认',
   ]),
+  defineCatalogCommand('goal', '查看或管理当前会话目标', [
+    '/goal [status|pause|resume]  查看、暂停或恢复当前会话目标',
+    '/goal 目标  创建目标（也可 /goal create [--rounds 轮数] 目标）',
+  ]),
   defineCatalogCommand('stop', '停止当前任务', [
     '/stop  停止当前任务',
   ]),

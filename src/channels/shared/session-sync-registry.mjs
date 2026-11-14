@@ -15,6 +15,26 @@ export function registerSessionSyncMirror(target, render) {
   };
 }
 
+/**
+ * duoduo fork: bots whose chat wants mid-turn text segments of synced turns
+ * (goal rounds) as they happen. A running channel registers its own bot only,
+ * so a segment can never reach a bot or channel that did not opt in.
+ */
+const liveSegmentBots = new Map();
+
+export function registerLiveSegmentBot(target) {
+  const key = botKey(target);
+  const entry = {};
+  liveSegmentBots.set(key, entry);
+  return () => {
+    if (liveSegmentBots.get(key) === entry) liveSegmentBots.delete(key);
+  };
+}
+
+export function liveSegmentsEnabled(target) {
+  return Boolean(target?.channel && target?.botId) && liveSegmentBots.has(botKey(target));
+}
+
 export async function deliverSessionSyncMirror(target, sessionId, turn, text) {
   const entry = renderers.get(botKey(target));
   if (!entry) return false;

@@ -134,6 +134,8 @@ function interactionRegistry(scope) {
       claims: new Map(),
       controls: new WeakMap(),
       imInputOrigins: new Map(),
+      // duoduo fork: the subset of imInputOrigins that steer a running turn.
+      imSteerInputs: new Set(),
       nextOrder: 0,
     };
     registries.set(scope, registry);
@@ -151,13 +153,29 @@ function pruneImInputOrigins(origins, now = Date.now()) {
   }
 }
 
-function registerImInputOrigin(registry, rpcId) {
+function registerImInputOrigin(registry, rpcId, { steer = false } = {}) {
   const origins = registry.imInputOrigins;
   pruneImInputOrigins(origins);
   origins.delete(rpcId);
   origins.set(rpcId, Date.now() + IM_INPUT_ORIGIN_TTL_MS);
   pruneImInputOrigins(origins);
-  return () => origins.delete(rpcId);
+  const steers = registry.imSteerInputs;
+  for (const id of steers) if (!origins.has(id)) steers.delete(id);
+  if (steer) steers.add(rpcId);
+  return () => {
+    origins.delete(rpcId);
+    steers.delete(rpcId);
+  };
+}
+
+/**
+ * duoduo fork: whether a registered dsh-im input steered a turn it did not
+ * open. A steer is the chat talking into someone else's turn (a goal round),
+ * so it must not make an observer believe the chat will answer that turn.
+ */
+export function isDshImSteerInput(scope, rpcId) {
+  if (!isDshImInputOrigin(scope, rpcId)) return false;
+  return interactionRegistry(scope).imSteerInputs.has(rpcId);
 }
 
 /** Consume a dsh-im prompt id while handling its durable user/message event. */
@@ -219,7 +237,9 @@ function normalizeControl(control) {
     || control.owner === null
     || typeof control.key !== 'string'
     || !control.key) return null;
-  return { owner: control.owner, key: control.key };
+  return { owner: control.owner, key: control.key,
+    readAnchor: control.readAnchor, saveAnchor: control.saveAnchor,
+    captureAnchorWriter: control.captureAnchorWriter, boundSession: control.boundSession };
 }
 
 function validModelSelection(value) {
@@ -459,8 +479,14 @@ export class AssistantTextAccumulator {
   }
 
   get text() {
+    return this.textExcluding(null);
+  }
+
+  /** The same text without the steps a consumer already delivered on its own. */
+  textExcluding(steps) {
     if (this.#steps.size === 0) return this.#legacyText;
     return [...this.#steps.entries()]
+      .filter(([step]) => !steps?.has(step))
       .sort(([left], [right]) => left - right)
       .map(([, parts]) => [...parts.entries()]
         .sort(([left], [right]) => left - right)
@@ -646,6 +672,22 @@ export class HarnessReplyTracker {
     return this.#finalAssistantText ? this.#finalAssistantText.text : this.answer;
   }
 
+  /**
+   * duoduo fork: the answer without the steps a live-segment consumer already
+   * posted mid-turn, so the turn-end message never repeats them.
+   */
+  answerExcluding(steps) {
+    if (!steps || steps.size === 0) return this.answer;
+    return this.#assistantText.textExcluding(steps).trim();
+  }
+
+  finalAnswerExcluding(steps) {
+    if (!steps || steps.size === 0) return this.finalAnswer;
+    return this.#finalAssistantText
+      ? this.#finalAssistantText.textExcluding(steps).trim()
+      : this.answerExcluding(steps);
+  }
+
   get reason() {
     return this.#reason;
   }
@@ -795,10 +837,15 @@ export class HarnessReplyTracker {
         // canonical 定稿且非空时按 step 透出，供分步推送消费方使用；
         // 先于 commitText 透出，保持 text 更新作为批次末尾的既有语义。
         if (text) {
+          const content = event.data?.message?.content;
           pushUpdate({
             type: 'assistant-message',
             step,
             text,
+            // A step that also calls a tool is never the final answer; live
+            // segment consumers may post its text before the turn ends.
+            ...(Array.isArray(content) && content.some((part) => part?.type === 'tool-call')
+              ? { toolCalls: true } : {}),
             ...(live ? { turn: this.#targetTurn } : {}),
           });
         }
@@ -1001,6 +1048,9 @@ export class HarnessClient {
   #competitiveApprovals;
   #interactionClaims;
   #controlOwnerships;
+  // One completed prompt per route, never an interaction/approval owner. The
+  // Host revalidates its uninterrupted goal lineage before every injection.
+  #continuationControls = new WeakMap();
 
   constructor({
     baseUrl,
@@ -1661,6 +1711,13 @@ export class HarnessClient {
 
   #unregisterControlOwnership(ownership) {
     if (!ownership.control) return;
+    if (ownership.started && ownership.turn !== null && !ownership.stopRequested) {
+      let routes = this.#continuationControls.get(ownership.control.owner);
+      if (!routes) this.#continuationControls.set(ownership.control.owner, routes = new Map());
+      routes.set(ownership.control.key, {
+        sessionId: ownership.sessionId, turn: ownership.turn, promptRpcId: ownership.promptRpcId,
+      });
+    }
     const routes = this.#controlOwnerships.get(ownership.control.owner);
     const owners = routes?.get(ownership.control.key);
     owners?.delete(ownership);
@@ -1735,6 +1792,18 @@ export class HarnessClient {
 
   async stopActiveTurn(sessionId, control, options = {}) {
     if (typeof sessionId !== 'string' || !sessionId) throw new TypeError('sessionId is required');
+    const boundSession = normalizeControl(control)?.boundSession;
+    if (typeof boundSession === 'function' && this.#controlExecutor) {
+      options.signal?.throwIfAborted();
+      const accepted = this.#controlExecutor({ sessionId, boundSession, action: 'stop' });
+      if (accepted && typeof accepted.then === 'function') throw new TypeError('controlExecutor must return synchronously');
+      if (accepted === true) {
+        const active = this.#activeControlOwnership(sessionId, control);
+        if (active) active.stopRequested = true;
+      }
+      // A route capability is process-local and must never authorize HTTP cancel.
+      return accepted === true;
+    }
     const ownership = await this.#refreshControlOwnership(sessionId, control, options);
     if (!ownership) return false;
     if (ownership.stopRequested) return true;
@@ -1782,17 +1851,40 @@ export class HarnessClient {
     if (typeof text !== 'string' || !text.trim()) {
       throw new TypeError('Steering text is required');
     }
+    const normalized = normalizeControl(control);
+    if (typeof normalized?.boundSession === 'function' && this.#controlExecutor) {
+      options.signal?.throwIfAborted();
+      const inputRpcId = `${this.#rpcIdPrefix}-steer-${randomUUID()}`;
+      const release = registerImInputOrigin(this.#interactionRegistry, inputRpcId, { steer: true });
+      try {
+        const accepted = this.#controlExecutor({ sessionId, boundSession: normalized.boundSession,
+          action: 'steer', inputRpcId, text });
+        if (accepted && typeof accepted.then === 'function') throw new TypeError('controlExecutor must return synchronously');
+        if (accepted !== true) release();
+        return accepted === true;
+      } catch (error) { release(); throw error; }
+    }
     const ownership = await this.#refreshControlOwnership(sessionId, control, options);
-    if (!ownership || ownership.stopRequested) return false;
-    if (this.#activeControlOwnership(sessionId, control) !== ownership) return false;
+    // A durable descriptor re-checks the current route binding on every call;
+    // it must not fall back to an in-memory credential invalidated by rebind.
+    const continuation = !ownership && normalized && this.#controlExecutor
+      ? typeof normalized.readAnchor === 'function' ? normalized.readAnchor()
+        : this.#controlCandidates(sessionId, control).findLast(candidate => candidate.started && !candidate.stopRequested)
+          ?? this.#continuationControls.get(normalized.owner)?.get(normalized.key)
+      : null;
+    if (!ownership && (!continuation || continuation.sessionId !== sessionId)) return false;
+    if (ownership && (ownership.stopRequested
+      || this.#activeControlOwnership(sessionId, control) !== ownership)) return false;
+    options.signal?.throwIfAborted();
     const inputRpcId = `${this.#rpcIdPrefix}-steer-${randomUUID()}`;
-    const releaseInputOrigin = registerImInputOrigin(this.#interactionRegistry, inputRpcId);
+    const releaseInputOrigin = registerImInputOrigin(this.#interactionRegistry, inputRpcId, { steer: true });
     try {
       if (this.#controlExecutor) {
         const accepted = this.#controlExecutor({
           sessionId,
-          expectedTurn: ownership.turn,
-          promptRpcId: ownership.promptRpcId,
+          expectedTurn: ownership?.turn,
+          promptRpcId: ownership?.promptRpcId ?? continuation.promptRpcId,
+          ...(continuation ? { continuationAfterTurn: continuation.turn } : {}),
           inputRpcId,
           action: 'steer',
           text,
@@ -1807,6 +1899,12 @@ export class HarnessClient {
           if (!accepted) releaseInputOrigin();
           return accepted;
         }
+      }
+      // Goal lineage cannot be checked atomically across HTTP. A cold/replaced
+      // Agent must never turn this fallback into a newly queued prompt.
+      if (continuation) {
+        releaseInputOrigin();
+        return false;
       }
       await this.rpc('session.prompt', {
         sessionId,
@@ -1824,6 +1922,12 @@ export class HarnessClient {
   #consumeInteractionOwnerships(sessionId, entries) {
     for (const ownership of this.#interactionOwnerships.get(sessionId) ?? []) {
       consumeInteractionOwnership(ownership, entries);
+      if (ownership.started && !ownership.anchorSave && typeof ownership.control?.saveAnchor === 'function') {
+        const anchor = { sessionId, turn: ownership.turn, promptRpcId: ownership.promptRpcId };
+        ownership.anchorSave = Promise.resolve().then(() => ownership.control.saveAnchor(anchor)).catch(error => {
+          console.warn('[dsh-im] unable to persist turn control anchor:', error?.message ?? error);
+        });
+      }
     }
   }
 
@@ -1947,6 +2051,9 @@ export class HarnessClient {
     // Reasoning updates only exist for consumers that opt in (thinking-trace
     // mode); default ask() consumers keep the pre-thinking-traces stream.
     const reasoning = options.reasoning === true;
+    // duoduo fork: steps the consumer already posted as live segments. The set
+    // is filled by onUpdate while the turn runs and read only at turn end.
+    const liveSteps = options.liveDeliveredSteps instanceof Set ? options.liveDeliveredSteps : null;
     const onArtifact = typeof options.onArtifact === 'function' ? options.onArtifact : null;
     const onInteraction = typeof options.onInteraction === 'function'
       ? options.onInteraction
@@ -1955,6 +2062,7 @@ export class HarnessClient {
       ? options.onInteractionResolved
       : undefined;
     const control = normalizeControl(options.control);
+    if (typeof control?.captureAnchorWriter === 'function') control.saveAnchor = control.captureAnchorWriter();
     const inboundFiles = !transferredPromptRpcId && Array.isArray(options.files) ? options.files.filter(Boolean) : [];
     const inboundImages = !transferredPromptRpcId && Array.isArray(options.images) ? options.images.filter(Boolean) : [];
     await this.ensureRunning({ signal });
@@ -2252,10 +2360,14 @@ export class HarnessClient {
             const artifactCount = ownership?.stopRequested
               ? 0
               : await deliverArtifacts();
-            const answer = ownership?.stopRequested ? tracker.answer : tracker.finalAnswer;
+            const answer = ownership?.stopRequested
+              ? tracker.answerExcluding(liveSteps)
+              : tracker.finalAnswerExcluding(liveSteps);
             if (answer) return answer;
             if (artifactCount > 0) return '';
             if (ownership?.stopRequested) throw turnStoppedError();
+            // Everything the turn wrote already reached the chat as segments.
+            if (liveSteps?.size > 0 && harnessTurnSucceeded(tracker.reason)) return '';
             if (artifactHandoffError) throw artifactHandoffError;
             // A completed turn can do all its work through tools without text.
             // Missing end reasons retain the existing empty-reply failure.
@@ -2322,8 +2434,9 @@ export class HarnessClient {
         // Once cancellation was accepted, transport/poll failures and timeouts
         // describe the convergence of that stop, not an unrelated ask failure.
         if (!ownership?.stopRequested) throw error;
-        if (tracker.answer) {
-          return tracker.answer;
+        const stoppedAnswer = tracker.answerExcluding(liveSteps);
+        if (stoppedAnswer) {
+          return stoppedAnswer;
         }
         if (error?.code === 'turn-stopped') throw error;
         throw turnStoppedError();
@@ -2342,6 +2455,7 @@ export class HarnessClient {
       closeArtifactConsumer?.();
       closeGroupHistoryAccess();
       if (ownership) {
+        await ownership.anchorSave;
         this.#unregisterControlOwnership(ownership);
         this.#unregisterInteractionOwnership(sessionId, ownership);
       }

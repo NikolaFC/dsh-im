@@ -2,6 +2,7 @@ import { isBatchInputCommand } from './batch-input.mjs';
 import { isCompactCommand } from './compact-command.mjs';
 import { isClearCommand } from './clear-command.mjs';
 import { isControlCommand } from './control-command.mjs';
+import { isGoalCommand } from './goal-command.mjs';
 import { isHistoryCommand } from './history-command.mjs';
 import { isModelCommand } from './model-command.mjs';
 import { isPresetCommand } from './preset-command.mjs';
@@ -21,7 +22,7 @@ export function isSharedLocalCommand(text, {
   const command = text.trim();
   if (!command) return false;
   if (isBatchInputCommand(command) || isHistoryCommand(command)) return true;
-  if (isClearCommand(command)) return true;
+  if (isClearCommand(command) || isGoalCommand(command)) return true;
   if (!hasFiles && (
     isControlCommand(command)
     || isModelCommand(command)

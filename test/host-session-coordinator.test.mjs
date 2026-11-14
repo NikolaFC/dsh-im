@@ -115,6 +115,48 @@ test('Host control executor refuses idle, replaced, closed, and foreign turns wi
   assert.deepEqual(calls, []);
 });
 
+test('goal steering requires exact retained prompt and uninterrupted same-goal turns', () => {
+  const { agent, calls } = liveAgent();
+  const anchor = [...agent.session.events,
+    { type: 'turn/end', data: { turn: 7, reason: { kind: 'completed' } } }];
+  const goal = (turn, goalId = 'goal-one') => [
+    { type: 'turn/start', data: { turn } },
+    { type: 'user/message', data: { source: { kind: 'goal', goalId, round: turn - 7 } } },
+  ];
+  const end = turn => ({ type: 'turn/end', data: { turn, reason: { kind: 'completed' } } });
+  const { controlExecutor } = createHarnessSessionExecutors(contextWith({ get: () => agent }));
+  const request = { sessionId: 'session-one', promptRpcId: 'prompt-owned', continuationAfterTurn: 7,
+    action: 'steer', inputRpcId: 'goal-steer', text: 'new instruction' };
+  agent.session.events = [...anchor, ...goal(8)];
+  assert.equal(controlExecutor(request), true);
+  assert.equal(controlExecutor({ ...request, promptRpcId: 'foreign' }), false);
+  assert.equal(controlExecutor({ ...request, continuationAfterTurn: 6 }), false);
+  assert.equal(controlExecutor({ ...request, action: 'stop' }), false);
+  agent.session.events.push(end(8), ...goal(9));
+  assert.equal(controlExecutor(request), true);
+  // A follow-up injected into the same goal turn does not replay the old input.
+  agent.session.events.push({ type: 'user/message', data: { source: { kind: 'user', rpcId: 'goal-steer' } } });
+  assert.equal(controlExecutor(request), true);
+  for (const events of [
+    [...anchor],
+    [...anchor, ...goal(8), end(8)],
+    [...anchor, ...goal(8), end(8), ...goal(9, 'different-goal')],
+    [...anchor, { type: 'turn/start', data: { turn: 8 } }],
+    [...anchor, { type: 'turn/start', data: { turn: 8 } }, end(8), ...goal(9)],
+    [...anchor, { type: 'turn/start', data: { turn: 8 } },
+      { type: 'user/message', data: { source: { kind: 'user', rpcId: 'manual' } } }, end(8), ...goal(9)],
+    [...anchor, ...goal(8), { type: 'turn/end', data: { turn: 8, reason: 'cancelled' } }, ...goal(9)],
+    [...goal(8)],
+  ]) {
+    agent.session.events = events;
+    assert.equal(controlExecutor(request), false, JSON.stringify(events));
+  }
+  agent.session.events = [...anchor, ...goal(8)];
+  agent.status = 'idle';
+  assert.equal(controlExecutor(request), false);
+  assert.equal(calls.length, 3, 'refused controls neither inject nor cancel');
+});
+
 test('Host executors preserve HTTP fallback when AgentRegistry or attachment is absent', async () => {
   const withoutRegistry = createHarnessSessionExecutors({});
   assert.equal(withoutRegistry.controlExecutor, undefined);

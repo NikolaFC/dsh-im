@@ -46,7 +46,9 @@
 - 会话处于 danger-full-access（approval=never）时不会发起审批，自然也没有批准按钮；需要验收批准时先用 `/permission workspace-write` 切档。切换只影响该会话，档位本身由 Host 权限预设定义。
 - 批准按钮复用既有审批队列控制器，只把展示换成 Discord 组件；提交仍落在 Host 审批接口，未新增旁路。
 - 选择题是单选/多选下拉，提交走既有问题回答通道；自由文本仍可通过消息回答。单选下拉已在 2026-11-09 真实点击验收：会话日志中 tool/call 与 tool/result 之间没有文字答复，结果由组件回调送回所选标签。
-- `/steer` 无参数不生成假选项，给出用法并说明普通消息即可按当前忙碌模式插话。
+- `/steer` 无参数不生成假选项，给出用法并说明普通消息即可按当前忙碌模式插话。插话已在真实会话验证：近 7 天 22 次 next-step 注入，用户消息进入正在运行的 turn。
+- 模型与推理等级切换已在 Discord 实机发生（2026-11-11 切到 deepseek-official/deepseek-flash + Max），之前无文字命令，属原生交互路径。
+- 批准按钮仍无真实点击样本：所有真实 Discord 会话均为 danger-full-access，不发起审批；验收需先切 workspace-write。多选下拉与 /help 面板点击同样暂无实测记录。
 
 ## 验证
 
