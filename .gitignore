@@ -12,3 +12,28 @@ e2e/
 # local verification helpers (personal paths, not part of the package)
 restart-host.sh
 restart-host.log
+
+# Private live acceptance captures
+/scripts/management-channel-list-receipt.json
+/scripts/management-channel-list.json
+/scripts/management-edit-ticket-receipt.json
+/scripts/management-edit-ticket.json
+/scripts/management-pin-ticket-receipt.json
+/scripts/management-pin-ticket.json
+/scripts/management-pins-ticket-receipt.json
+/scripts/management-pins-ticket.json
+/scripts/management-read-ticket-receipt.json
+/scripts/management-read-ticket.json
+/scripts/management-unpin-ticket-receipt.json
+/scripts/management-unpin-ticket.json
+/scripts/ticket-001-archive-receipt.json
+/scripts/ticket-001-list-receipt.json
+/scripts/ticket-001-receipt.json
+/scripts/ticket-001-reopen-receipt.json
+/scripts/ticket-001-update-receipt.json
+/scripts/ticket-create.json
+/scripts/ticket-inspect.json
+/scripts/ticket-list.json
+/scripts/ticket-reopen.json
+/scripts/ticket-update.json
+/scripts/ticket-verify.json
