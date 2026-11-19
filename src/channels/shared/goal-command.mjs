@@ -1,6 +1,7 @@
 import { t } from './i18n.mjs';
 import { withSessionBindingLock } from './session-binding-lock.mjs';
 import { WORKSPACE_SESSION_STALE } from './workspace-session.mjs';
+import { beginDiscordGoalOutputAdmission } from './discord-goal-output.mjs';
 
 export const GOAL_USAGE = '用法：/goal [status|pause|resume]；创建：/goal 目标 或 /goal create [--rounds 轮数] 目标（1–256 轮）。';
 export const GOAL_CREATE_HINT = '创建目标：发送 /goal 目标（也可用 /goal create [--rounds 轮数] 目标）；Discord 也可选择 action:create 并填写 objective。';
@@ -77,6 +78,9 @@ export async function runGoalCommand(text, harness, state, key, options = {}) {
     // Reading or changing a goal needs the conversation's own Session; only an
     // explicit create may open one, so `/goal` on a fresh conversation can set
     // the objective before the first prompt.
+    // A fresh conversation simply has no goal yet; only pause/resume need to
+    // say that nothing is bound.
+    if (parsed.action === 'status') return { handled: true, message: t('当前会话尚未设置目标。'), goal: null };
     if (parsed.action !== 'create'
       || typeof harness?.createSession !== 'function'
       || typeof harness?.workspaceSession !== 'function'
@@ -92,16 +96,34 @@ export async function runGoalCommand(text, harness, state, key, options = {}) {
   // Never fall back to the global/latest session or submit a slash as a prompt.
   const session = harness?.workspaceSession?.(sessionId, key);
   if (typeof session?.executeCommand !== 'function') return reply(t('当前 Harness 暂不支持目标命令。'));
+  const bindingVersion = state.controlBindingVersion?.(key);
+  const actor = ['create', 'resume'].includes(parsed.action) && options.discordGoalActor?.();
+  const endAdmission = actor && typeof state.rememberGoalOutputRoute === 'function'
+    ? beginDiscordGoalOutputAdmission(sessionId) : null;
+  const assertSessionBound = () => {
+    if (state.sessionFor(key) !== sessionId || state.controlBindingVersion?.(key) !== bindingVersion) {
+      throw Object.assign(new Error('Session binding changed'), { code: WORKSPACE_SESSION_STALE });
+    }
+  };
   try {
     const execution = await session.executeCommand(text.trim(), { signal: options.signal,
-      assertSessionBound: () => {
-        if (state.sessionFor(key) !== sessionId) throw Object.assign(new Error('Session binding changed'), { code: 'workspace-session-stale' });
-      },
+      assertSessionBound,
+      ...(endAdmission ? {
+        async onGoalMutation({ goalId, revision, goalStartSeq }) {
+          assertSessionBound();
+          if (options.signal?.aborted || options.discordGoalActor() !== actor) return;
+          await state.rememberGoalOutputRoute(key, {
+            sessionId, goalId, revision, actor, goalStartSeq, deliverySeqFloor: goalStartSeq,
+          }, bindingVersion);
+        },
+      } : {}),
     });
     if (!execution || !['success', 'error'].includes(execution.result?.kind)) return reply(t('当前 Harness 暂不支持目标命令。'));
     return { handled: true, message: execution.result.text, goal: execution.goal ?? null };
   } catch (error) {
     const code = error?.code ?? error?.failure?.code ?? 'unavailable';
     return reply(t('目标操作未完成（{code}），请重新查看 /goal status。', { code }));
+  } finally {
+    endAdmission?.();
   }
 }

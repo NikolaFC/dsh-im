@@ -13,7 +13,7 @@ import { registerLiveSegmentBot } from '../shared/session-sync-registry.mjs';
 import { DiscordApi } from './discord-api.mjs';
 import { discordTypingRetryAfterMs } from './typing-error.mjs';
 import { PICKER_COMMANDS, discordCommandChoices, DiscordCommandPickers, boundedDiscordContent } from './discord-command-picker.mjs';
-import { discordCardComponents, normalizeDiscordInteraction, syncDiscordCommands } from './discord-interactions.mjs';
+import { discordCardComponents, discordGoalModal, normalizeDiscordInteraction, syncDiscordCommands } from './discord-interactions.mjs';
 import { createDiscordBridgeStatus, DiscordHarnessBridge } from './discord-bridge.mjs';
 
 const DISCORD_GATEWAY_INTENTS = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15);
@@ -481,12 +481,26 @@ export class DiscordBotClient {
     const chunks = (markdown ? chunkMarkdownText : splitMessageText)(notice ? `${notice}\n\n${text}` : text, 1_900);
     const providerMessageIds = [];
     for (const [index, chunk] of chunks.entries()) {
-      const result = await this.#api.createMessage({
-        channelId: target.channelId,
-        content: chunk,
-        replyToMessageId: index === 0 ? target.replyToMessageId : undefined,
-        signal: this.#signal,
-      });
+      if (target.prepareGoalDelivery) {
+        const assertAllowed = await target.prepareGoalDelivery();
+        assertAllowed();
+      }
+      let result;
+      try {
+        result = await this.#api.createMessage({
+          channelId: target.channelId,
+          content: chunk,
+          replyToMessageId: index === 0 ? target.replyToMessageId : undefined,
+          signal: target.deliverySignal ?? this.#signal,
+          ...(target.prepareGoalDelivery ? { retry: false } : {}),
+        });
+      } catch (cause) {
+        if (!target.prepareGoalDelivery || (cause?.status >= 400 && cause?.status < 500)) throw cause;
+        throw Object.assign(new Error('Discord Goal delivery result is unknown', { cause }), { code: 'send-result-unknown' });
+      }
+      if (target.prepareGoalDelivery && (typeof result?.id !== 'string' || !result.id)) {
+        throw Object.assign(new Error('Discord Goal delivery returned no message id'), { code: 'send-result-unknown' });
+      }
       if (notice && index === 0) this.#deliveredNotices.add(target);
       if (typeof result?.id === 'string' && result.id) providerMessageIds.push(result.id);
     }
@@ -915,6 +929,43 @@ export class DiscordRuntime {
     return this.#bridge.sendProactiveText({ channelId }, text, options);
   }
 
+  async sendDiscordGoalText(route, text, { signal, validate, isRouteCurrent, claim, assertGoalCurrent } = {}) {
+    const runtimeSignal = this.#abortController?.signal;
+    if (!this.#status.ready || !this.#bridge || signal?.aborted || !runtimeSignal || runtimeSignal.aborted
+      || route?.botId !== this.#config.botId || typeof validate !== 'function'
+      || typeof isRouteCurrent !== 'function' || typeof claim !== 'function') return false;
+    const match = /^(direct|group):(\d{5,30})$/u.exec(route.conversationKey);
+    if (!match || !route.actor) return false;
+    const [, kind, channelId] = match;
+    const deliverySignal = signal ? AbortSignal.any([runtimeSignal, signal]) : runtimeSignal;
+    const isAllowed = () => !deliverySignal.aborted && this.#status.ready && isRouteCurrent()
+      && this.#state.sessionFor(route.conversationKey) === route.sessionId
+      && (assertGoalCurrent === undefined || assertGoalCurrent() === true)
+      && this.#accessPolicy && evaluateInboundAccess(this.#accessPolicy, {
+        conversationType: kind, senderIds: [route.actor], text: '/goal', isCommand: true,
+      }).allowed;
+    if (!await validate() || !isAllowed()) return false;
+    const channel = await this.#api.getChannel({ channelId, signal: deliverySignal });
+    if (String(channel?.id ?? '') !== channelId) return false;
+    const validChannel = kind === 'direct'
+      ? channel.type === 1 && channel.recipients?.length === 1 && String(channel.recipients[0]?.id) === route.actor
+      : channel.type === GUILD_TEXT || channel.type === GUILD_ANNOUNCEMENT || isThreadChannel(channel);
+    if (!validChannel || !await validate() || !isAllowed() || !await claim()) return false;
+    const prepareGoalDelivery = async () => {
+      const unique = await validate();
+      // This final check must share the same synchronous step as the POST.
+      return () => {
+        if (!unique || !isAllowed()) {
+          throw Object.assign(new Error('Discord Goal route is unavailable'), { code: 'stale-route' });
+        }
+      };
+    };
+    const receipt = await this.#bridge.sendProactiveText({ channelId, deliverySignal, prepareGoalDelivery }, text, {
+      signal: deliverySignal, format: 'markdown',
+    });
+    return receipt?.providerMessageIds?.length > 0;
+  }
+
   async start() {
     if (this.#status.ready && this.#socket) return this.status;
     if (this.#starting) return this.#starting;
@@ -1171,17 +1222,30 @@ export class DiscordRuntime {
     const wantsHelp = interaction.type === 2 && commandName === 'help';
     let wantsPicker = interaction.type === 2 && (PICKER_COMMANDS.has(commandName) || commandName === 'steer')
       && normalized.content === `/${commandName}`;
+    const key = `${normalized.kind}:${normalized.conversationId}`;
+    // An unauthorized press must not retire the owner's still-live picker.
+    if (pickerPress && !this.#commandPickers.belongsTo(normalized)) {
+      await api.respondInteraction({ interactionId: interaction.id, token: interaction.token, type: 6,
+        signal: this.#abortController?.signal });
+      return;
+    }
+    const claimed = pickerPress ? this.#commandPickers.claim(normalized, this.#state.sessionFor(key)) : null;
+    // Creating a goal needs an objective; a form is the only input a phone can
+    // give a select or an option-less slash. A modal must be the first response.
+    if ((claimed === '/goal create' || (interaction.type === 2 && normalized.content === '/goal create'))
+      && this.#mayRun(normalized)) {
+      await api.respondInteraction({ interactionId: interaction.id, token: interaction.token,
+        type: 9, data: discordGoalModal(), signal: this.#abortController?.signal });
+      return;
+    }
     if (wantsPicker || pickerPress || wantsHelp) {
       const signal = this.#abortController?.signal;
       await api.respondInteraction({ interactionId: interaction.id, token: interaction.token,
         type: pickerPress ? 6 : 5, ...(pickerPress ? {} : { data: { flags: 64 } }), signal });
       const handle = { applicationId: this.#config.platformId, token: interaction.token };
       normalized.replyTarget.interactionResponse = handle;
-      const key = `${normalized.kind}:${normalized.conversationId}`;
       if (pickerPress) {
-        // An unauthorized press must not retire the owner's still-live picker.
-        if (!this.#commandPickers.belongsTo(normalized)) return;
-        const command = this.#commandPickers.claim(normalized, this.#state.sessionFor(key));
+        const command = claimed;
         if (!command) {
           await api.editOriginalInteraction({ ...handle, content: '此选项已失效或不属于你，请重新执行命令。', signal });
           return;
@@ -1234,12 +1298,21 @@ export class DiscordRuntime {
     // ACK is the first I/O, before route lookup, access checks or Host work.
     await api.respondInteraction({ interactionId: interaction.id, token: interaction.token,
       type: interaction.type === 3 ? 6 : 4,
-      ...(interaction.type === 2 ? { data: { content: t('已收到操作，请查看下方结果。'), flags: 64 } } : {}),
+      ...(interaction.type !== 3 ? { data: { content: t('已收到操作，请查看下方结果。'), flags: 64 } } : {}),
       signal: this.#abortController?.signal });
     if (interaction.type === 3) return bridge.acceptCallback(normalized);
     // Slash commands use the exact channel/thread binding and access policy of
     // text commands, without creating a thread or pretending to be a message.
     return bridge.accept(normalized);
+  }
+
+  /** The same access gate the command itself will pass, so a stranger never gets the form. */
+  #mayRun(normalized) {
+    if (!this.#accessPolicy) return true;
+    return evaluateInboundAccess(this.#accessPolicy, {
+      conversationType: normalized.kind, senderIds: [normalized.senderId], text: normalized.content,
+      hasImages: false, hasFiles: false,
+    }).allowed;
   }
 
   #rememberChannel(channel) {

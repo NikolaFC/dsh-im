@@ -15,6 +15,11 @@ import {
   deliverSessionSyncMirror,
   liveSegmentsEnabled,
 } from '../../src/channels/shared/session-sync-registry.mjs';
+import {
+  deliverDiscordGoalTurn,
+  isDiscordGoalCandidate,
+  resolveDiscordGoalOutput,
+} from './discord-goal-sync.mjs';
 
 /**
  * Where the turn came from, as far as a chat mirror is concerned.
@@ -88,6 +93,7 @@ export function createSessionSyncCoordinator({
   logger = console,
   loadSettings = null,
   liveSegments = liveSegmentsEnabled,
+  isSteer,
 } = {}) {
   if (typeof deliveryService?.deliverSessionText !== 'function') {
     throw new TypeError('Session sync requires a delivery service that can follow a Session binding');
@@ -95,6 +101,7 @@ export function createSessionSyncCoordinator({
 
   const turns = new Map();
   const tails = new Map();
+  const lifetime = new AbortController();
   let closed = false;
 
   const logFailure = (phase, error) => {
@@ -257,6 +264,10 @@ export function createSessionSyncCoordinator({
     if (!deliverable || state.echoFailed) return;
     const settings = await readSettings(state);
     if (!settings.deliverModelAnswers) return;
+    if (state.sawDiscordGoalCandidate) {
+      state.discordGoalOutput ??= resolveDiscordGoalOutput(deliveryService, sessionId);
+      if (await state.discordGoalOutput) return;
+    }
     await deliverSegment(sessionId, withDeliverySyncIcon(settings.modelIcon, text));
   };
 
@@ -266,7 +277,9 @@ export function createSessionSyncCoordinator({
     // is already visible in that chat and does not answer the turn, so it
     // neither claims the turn nor gets echoed.
     if (originHint === 'im-steer') return;
-    const origin = classifyTurnInput(event.data?.source, { imOwned: originHint === 'im' });
+    const source = event.data?.source;
+    const origin = classifyTurnInput(source, { imOwned: originHint === 'im' });
+    if (isDiscordGoalCandidate(source)) state.sawDiscordGoalCandidate = true;
     // Only a message that says where the reader was may own the turn. A service
     // injection — the runtime context the Host prepends, a reminder, a notice —
     // is often the first message of a turn and says nothing about the reader,
@@ -321,7 +334,7 @@ export function createSessionSyncCoordinator({
     );
   };
 
-  const processEvent = async (sessionId, event, origin = 'other') => {
+  const processEvent = async (sessionId, event, origin = 'other', session) => {
     if (closed || !event || typeof event !== 'object') return;
 
     if (event.type === 'turn/start') {
@@ -331,6 +344,7 @@ export function createSessionSyncCoordinator({
         turn,
         origin: null,
         sawInternal: false,
+        sawDiscordGoalCandidate: false,
         settings: null,
         echoed: new Set(),
         echoFailed: false,
@@ -340,13 +354,24 @@ export function createSessionSyncCoordinator({
     }
 
     const state = turns.get(sessionId);
+    if (event.type === 'turn/end') {
+      if (state && state.turn !== event.data?.turn) return;
+      turns.delete(sessionId);
+      if (state?.origin === TURN_INPUT_ORIGINS.im) return;
+      if (!state || state.sawDiscordGoalCandidate) {
+        if (await deliverDiscordGoalTurn({
+          deliveryService, sessionId, session, event, isSteer, signal: lifetime.signal,
+        })) return;
+      }
+      if (state) await onTurnEnd(sessionId, state, event);
+      return;
+    }
     if (!state) return;
 
     if (event.type === 'user/message') {
       await onUserMessage(sessionId, state, event, origin);
       return;
     }
-
     // The chat gets the final answer of the turn, not a transcript of it: the
     // accumulator keeps only what arrived after the last tool call.
     if (event.type === 'assistant/message' || event.type === 'assistant/chunk'
@@ -362,17 +387,14 @@ export function createSessionSyncCoordinator({
       return;
     }
 
-    if (event.type !== 'turn/end' || event.data?.turn !== state.turn) return;
-    turns.delete(sessionId);
-    await onTurnEnd(sessionId, state, event);
   };
 
-  const enqueue = (sessionId, event, origin = 'other') => {
+  const enqueue = (sessionId, event, origin = 'other', session) => {
     if (closed || typeof sessionId !== 'string' || !sessionId) return Promise.resolve();
     const previous = tails.get(sessionId) ?? Promise.resolve();
     const task = previous.then(
-      () => processEvent(sessionId, event, origin),
-      () => processEvent(sessionId, event, origin),
+      () => processEvent(sessionId, event, origin, session),
+      () => processEvent(sessionId, event, origin, session),
     );
     const tail = task.catch((error) => logFailure('event handling', error)).finally(() => {
       if (tails.get(sessionId) === tail) tails.delete(sessionId);
@@ -388,6 +410,7 @@ export function createSessionSyncCoordinator({
     },
     close() {
       closed = true;
+      lifetime.abort();
       turns.clear();
     },
   });
@@ -430,6 +453,7 @@ export function installSessionSyncCoordinator(ctx, deliveryService, {
     deliveryService,
     logger,
     loadSettings: readSettings,
+    isSteer: event => imSteerInput(inputScope, event),
   });
   const disposeEvent = ctx.on('session/event', (session, event) => {
     const sessionId = sessionIdOf(session);
@@ -440,7 +464,7 @@ export function installSessionSyncCoordinator(ctx, deliveryService, {
     const origin = event?.type === 'user/message' && imInputOwnership(inputScope, event)
       ? (imSteerInput(inputScope, event) ? 'im-steer' : 'im')
       : 'other';
-    void coordinator.enqueue(sessionId, event, origin);
+    void coordinator.enqueue(sessionId, event, origin, session);
   }, { global: true });
   let disposed = false;
   const close = () => {

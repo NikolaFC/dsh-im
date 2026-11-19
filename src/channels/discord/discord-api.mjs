@@ -234,7 +234,8 @@ export class DiscordApi {
   respondInteraction({ interactionId, token, type, data, signal }) {
     if (typeof token !== 'string' || !/^[A-Za-z0-9._-]+$/.test(token)) throw new TypeError('Invalid interaction token');
     return this.#request(`interactions/${snowflake(interactionId, 'interaction id')}/${token}/callback`, {
-      method: 'POST', body: { type, ...(data ? { data: { ...data, allowed_mentions: { parse: [], replied_user: false } } } : {}) },
+      // A modal (type 9) carries no message, so it takes no mention policy.
+      method: 'POST', body: { type, ...(data ? { data: type === 9 ? data : { ...data, allowed_mentions: { parse: [], replied_user: false } } } : {}) },
       signal, timeoutMs: 2500, expectBody: false, retry: false,
     });
   }
@@ -453,10 +454,11 @@ export class DiscordApi {
     );
   }
 
-  createMessage({ channelId, content, components, replyToMessageId, signal }) {
+  createMessage({ channelId, content, components, replyToMessageId, signal, retry = true }) {
     return this.#request(`channels/${snowflake(channelId, 'channel id')}/messages`, {
       method: 'POST',
       signal,
+      retry,
       body: {
         content,
         ...(components === undefined ? {} : { components }),

@@ -247,6 +247,15 @@ export class TokenBotController {
     });
   }
 
+  async sendDiscordGoalText(botId, route, text, options) {
+    if (this.#descriptor.key !== 'discord' || !this.#configStore.get(botId)) return false;
+    return this.#withBotTransition(botId, async () => {
+      const runtime = this.#runtimes.get(botId);
+      if (!runtime?.status?.ready || typeof runtime.sendDiscordGoalText !== 'function') return false;
+      return runtime.sendDiscordGoalText(route, text, options);
+    });
+  }
+
   async presentSessionSyncApproval(botId, target, interaction, options = {}) {
     return this.#presentSessionSyncInteraction('presentSessionSyncApproval', botId, target, interaction, options);
   }

@@ -8,7 +8,7 @@ import { dirname } from 'node:path';
  */
 const EXTENSION_KEYS = Object.freeze([
   'emailBindings', 'mailCursor', 'pendingAuth', 'threadIds', 'rootAnchors',
-  'whatsappBotMessageIds',
+  'whatsappBotMessageIds', 'goalOutputRoutes',
 ]);
 
 const PENDING_MESSAGE_LIMIT = 200;
@@ -263,6 +263,7 @@ export class ConversationStateStore {
     if (this.sessionFor(key) !== sessionId) {
       this.#bindingVersions.set(key, this.controlBindingVersion(key) + 1);
       if (this.#state.controlAnchors) delete this.#state.controlAnchors[key];
+      this.clearBindingExtension(key);
     }
     this.#state.sessions[key] = sessionId;
     await this.#persist();
@@ -271,12 +272,16 @@ export class ConversationStateStore {
   async clearSession(key) {
     this.#bindingVersions.set(key, this.controlBindingVersion(key) + 1);
     if (this.#state.controlAnchors) delete this.#state.controlAnchors[key];
+    this.clearBindingExtension(key);
     delete this.#state.sessions[key];
     await this.#persist();
   }
 
   async clearSessions() {
-    for (const key of Object.keys(this.#state.sessions)) this.#bindingVersions.set(key, this.controlBindingVersion(key) + 1);
+    for (const key of Object.keys(this.#state.sessions)) {
+      this.#bindingVersions.set(key, this.controlBindingVersion(key) + 1);
+      this.clearBindingExtension(key);
+    }
     delete this.#state.controlAnchors;
     this.#state.sessions = {};
     await this.#persist();
@@ -334,6 +339,9 @@ export class ConversationStateStore {
   extensionState() {
     return this.#state;
   }
+
+  /** Remove subclass state tied to this exact binding before persisting it. */
+  clearBindingExtension(_key) {}
 
   /** Flush the current state to disk after an extension write. */
   persist() {

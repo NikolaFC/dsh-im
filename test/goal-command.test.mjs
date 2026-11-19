@@ -120,7 +120,13 @@ test('an unbound conversation reads a goal without silently opening a Session', 
     createSession: async () => { created += 1; return 'session-fresh'; },
     workspaceSession: () => ({ executeCommand: () => assert.fail('no Session may be opened for a read') }),
   };
-  for (const command of ['/goal', '/goal status', '/goal pause', '/goal resume']) {
+  // A fresh chat (e.g. right after /new) just has no goal yet; only mutations say it is unbound.
+  for (const command of ['/goal', '/goal status']) {
+    const result = await runGoalCommand(command, harness, state, 'group:fresh');
+    assert.equal(result.message, '当前会话尚未设置目标。', command);
+    assert.equal(result.goal, null);
+  }
+  for (const command of ['/goal pause', '/goal resume']) {
     const result = await runGoalCommand(command, harness, state, 'group:fresh');
     assert.match(result.message, /绑定会话|bound/iu, command);
   }
@@ -165,13 +171,15 @@ test('host errors are surfaced without retrying a mutation', async () => {
 
 test('native goal fields have explicit actions and validated objective/rounds', () => {
   const definition = DISCORD_APPLICATION_COMMANDS.find(item => item.name === 'goal');
-  assert.deepEqual(definition.options[0].choices.map(item => item.value), ['status', 'create', 'pause', 'resume']);
+  assert.equal(definition.options[0].name, 'objective');
+  assert.deepEqual(definition.options[1].choices.map(item => item.value), ['status', 'create', 'pause', 'resume']);
   const data = options => ({ type: 1, name: 'goal', options });
   const action = { name: 'action', type: 3, value: 'create' };
   assert.equal(discordCommandText(data([])), '/goal');
   assert.equal(discordCommandText(data([action])), '/goal create');
   assert.equal(discordCommandText(data([action, { name: 'objective', type: 3, value: 'mock objective' }, { name: 'rounds', type: 4, value: 5 }])), '/goal create --rounds 5 mock objective');
-  for (const options of [[action, action], [{ ...action, value: 'delete' }], [action, { name: 'rounds', type: 4, value: 0 }], [action, { name: 'objective', type: 3, value: 'x\n/stop' }], [{ name: 'objective', type: 3, value: 'x' }]]) assert.equal(discordCommandText(data(options)), null);
+  assert.equal(discordCommandText(data([{ name: 'objective', type: 3, value: 'x' }])), '/goal create --rounds 256 x');
+  for (const options of [[action, action], [{ ...action, value: 'delete' }], [action, { name: 'rounds', type: 4, value: 0 }], [action, { name: 'objective', type: 3, value: 'x\n/stop' }]]) assert.equal(discordCommandText(data(options)), null);
 });
 
 test('empty goal picker includes current status and only meaningful state actions', async () => {
@@ -193,7 +201,8 @@ test('an unbound goal picker still offers creation and says how to create', asyn
   const panel = await discordCommandChoices('goal',
     { workspaceSession: () => assert.fail('a picker read opens no Session') },
     { sessionFor: () => null }, 'group:fresh');
-  assert.match(panel.content, /绑定会话/);
+  assert.match(panel.content, /尚未设置目标/);
+  assert.doesNotMatch(panel.content, /绑定会话/);
   assert.match(panel.content, /\/goal create/);
   assert.deepEqual(panel.choices.map(item => item.command), ['/goal status', '/goal create']);
 });

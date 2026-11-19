@@ -1013,6 +1013,14 @@ export class TextHarnessBridge {
           pendingInteraction: this.#pendingInteractions.has(key)
             || this.#approvals.hasPending(key),
           control: this.#turnControl(key, message),
+          ...(runner === runGoalCommand && this.#descriptor.key === 'discord' ? {
+            discordGoalActor: () => this.#accessPolicy && message.senderIsBot !== true
+              && evaluateInboundAccess(this.#accessPolicy, {
+                conversationType: message.kind,
+                senderIds: [senderId, message.senderAlternateId].filter(Boolean),
+                isCommand: true,
+              }).allowed ? senderId : null,
+          } : {}),
           deferredDelivery: this.#deferred,
           enhancement: captureContextEnhancementSource(
             this.#contextEnhancement,

@@ -1,11 +1,20 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
+import { createHarnessCommandExecutor } from '../../../plugin-src/host/harness-command-executor.mjs';
+import { harnessConnection } from '../../../plugin-src/host/harness-connection.mjs';
 import { DISCORD_COMMAND_GUILD, DISCORD_APPLICATION_COMMANDS, syncDiscordCommands,
   discordCommandText, normalizeDiscordInteraction, DISCORD_INTERACTION_CARD,
-  DiscordApprovalCard, discordCardComponents } from '../../../src/channels/discord/discord-interactions.mjs';
+  DiscordApprovalCard, discordCardComponents, discordGoalModal } from '../../../src/channels/discord/discord-interactions.mjs';
 import { DiscordHarnessBridge } from '../../../src/channels/discord/discord-bridge.mjs';
 import { DiscordApi } from '../../../src/channels/discord/discord-api.mjs';
 import { DiscordBotClient, DiscordRuntime } from '../../../src/channels/discord/discord-runtime.mjs';
+import { DiscordHarnessClient } from '../../../src/channels/discord/harness-client.mjs';
+import { DiscordStateStore } from '../../../src/channels/discord/state-store.mjs';
+import { BotWorkspaceStore, createBotWorkspaceScope } from '../../../src/channels/shared/bot-workspace-store.mjs';
+import { directAccessPolicy } from '../access-policy-fixture.mjs';
 
 const app = '123456789012345678';
 const event = { id: '223456789012345678', token: 'test_token', application_id: app,
@@ -84,6 +93,188 @@ test('command readbacks with default required=false omitted do not trigger repea
   assert.deepEqual(result.updated, []);
   assert.deepEqual(result.collisions, []);
   assert.deepEqual(writes, []);
+});
+
+test('goal registration moves the free objective first for both guild and bot DM commands', async () => {
+  const writes = [];
+  const commands = direct => DISCORD_APPLICATION_COMMANDS.map((command, index) => {
+    const id = `${direct ? 'global' : 'guild'}-${index}`;
+    let options = command.options;
+    if (command.name === 'goal') {
+      const [objective, action, rounds] = options;
+      options = [action, objective, rounds];
+    }
+    return { ...command, id, options, ...(direct ? { contexts: [1], integration_types: [0] } : {}) };
+  });
+  const result = await syncDiscordCommands({
+    listApplicationCommands: async ({ guildId }) => commands(guildId === undefined),
+    createApplicationCommand: async () => assert.fail('existing commands must be updated in place'),
+    editApplicationCommand: async update => writes.push(update),
+  }, app);
+  assert.deepEqual(result.guild.updated, ['goal']);
+  assert.deepEqual(result.global.updated, ['goal']);
+  assert.equal(writes.length, 2);
+  for (const { command } of writes) {
+    assert.deepEqual(command.options.map(option => option.name), ['objective', 'action', 'rounds']);
+    assert.ok(command.options.every(option => option.required === false));
+    assert.equal(command.options[0].type, 3);
+    assert.equal(command.options[0].choices, undefined);
+    assert.deepEqual(command.options[1].choices.map(choice => choice.value), ['status', 'create', 'pause', 'resume']);
+  }
+});
+
+test('goal objective alone creates and legacy action and short controls remain unambiguous', () => {
+  const native = (...options) => discordCommandText({ type: 1, name: 'goal', options });
+  const objective = value => ({ name: 'objective', type: 3, value });
+  const action = value => ({ name: 'action', type: 3, value });
+  const rounds = value => ({ name: 'rounds', type: 4, value });
+  assert.equal(native(), '/goal');
+  assert.equal(native(objective(' 写完周报 ')), '/goal create --rounds 256 写完周报');
+  assert.equal(native(rounds(12), objective('create a report')), '/goal create --rounds 12 create a report');
+  assert.equal(native(action('create'), objective('写完周报')), '/goal create --rounds 256 写完周报');
+  assert.equal(native(action('create')), '/goal create');
+  assert.equal(native(objective('create')), '/goal create');
+  for (const shortcut of ['status', 'pause', 'resume']) {
+    assert.equal(native(objective(shortcut)), `/goal ${shortcut}`);
+    assert.equal(native(action(shortcut)), `/goal ${shortcut}`);
+    assert.equal(native(action('create'), objective(shortcut)), `/goal create --rounds 256 ${shortcut}`);
+  }
+  assert.equal(native(objective('status'), rounds(12)), '/goal create --rounds 12 status');
+  for (const invalid of [
+    [action('pause'), objective('write a report')], [action('status'), rounds(12)], [rounds(12)],
+    [objective(' first '), objective('second')], [objective(' \n')], [objective('a\n/goal pause')],
+    [objective('x'.repeat(1001))], [objective('ok'), rounds(257)], [null],
+  ]) assert.equal(native(...invalid), null);
+});
+
+test('goal form submission becomes the typed create command; bad input falls back to the hint', () => {
+  const submit = (objective, rounds) => normalizeDiscordInteraction({ ...event, type: 5, data: { custom_id: 'dgoal1', components: [
+    { type: 1, components: [{ type: 4, custom_id: 'objective', value: objective }] },
+    { type: 18, component: { type: 4, custom_id: 'rounds', value: rounds } },
+  ] } }, app);
+  assert.equal(submit(' 把星露谷玩到秋天 ', '').content, '/goal create --rounds 256 把星露谷玩到秋天');
+  assert.equal(submit('写完周报', '12').content, '/goal create --rounds 12 写完周报');
+  for (const [objective, rounds] of [['', ''], ['--x', ''], ['ok', '0'], ['ok', '999'], ['ok', '1.5']]) {
+    assert.equal(submit(objective, rounds).content, '/goal create');
+  }
+  assert.equal(normalizeDiscordInteraction({ ...event, type: 5, data: { custom_id: 'other', components: [] } }, app), null);
+  assert.equal(discordGoalModal().custom_id, 'dgoal1');
+});
+
+test('an option-less /goal create opens the form as the first response', async () => {
+  const calls = []; const listeners = new Map();
+  const socket = { readyState: 1, addEventListener: (name, fn) => listeners.set(name, fn),
+    send: raw => { if (JSON.parse(raw).op === 2) queueMicrotask(() => listeners.get('message')({ data: JSON.stringify({ op: 0, t: 'READY', d: { session_id: 's' } }) })); }, close() {} };
+  const runtime = new DiscordRuntime({ config: { platformId: app, botId: 'test' }, token: 'test',
+    harness: { ensureRunning: async () => true },
+    state: { hasSeen: () => false, markSeen: async () => {}, sessionFor: () => undefined },
+    createApi: () => ({ getCurrentUser: async () => ({ id: app, bot: true }), getGatewayBot: async () => ({ url: 'wss://gateway.discord.gg' }),
+      respondInteraction: async args => calls.push(args),
+      createMessage: async () => assert.fail('the form must not post a message') }),
+    createWebSocket: () => { queueMicrotask(() => listeners.get('message')({ data: JSON.stringify({ op: 10, d: { heartbeat_interval: 45000 } }) })); return socket; },
+  });
+  try {
+    await runtime.start();
+    listeners.get('message')({ data: JSON.stringify({ op: 0, t: 'INTERACTION_CREATE', d: { ...event,
+      data: { name: 'goal', type: 1, options: [{ name: 'action', type: 3, value: 'create' }] } } }) });
+    for (let i = 0; i < 100 && !calls.length; i++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].type, 9);
+    assert.equal(calls[0].data.custom_id, 'dgoal1');
+  } finally { await runtime.stop(); }
+});
+
+test('Gateway objective-only /goal creates immediately through the Host and persists its output route', { timeout: 5_000 }, async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'discord-inline-goal-'));
+  let runtime;
+  let connection;
+  t.after(async () => {
+    await runtime?.stop();
+    connection?.apiProxy.dispose();
+    await rm(dir, { recursive: true, force: true });
+  });
+  const sessionId = 'bound-session';
+  const key = `group:${event.channel_id}`;
+  const actor = event.member.user.id;
+  const workspaces = await new BotWorkspaceStore(join(dir, 'workspaces.json'), { defaultWorkspace: dir }).load();
+  await workspaces.ensure('test');
+  const statePath = join(dir, 'state.json');
+  const state = await new DiscordStateStore(statePath).load();
+  await state.setSession(key, sessionId);
+  const policy = directAccessPolicy({ users: [{ id: actor, canExecuteCommands: true }] });
+  policy.getSettings().group = policy.getSettings().direct;
+
+  const records = [], rpc = [], acknowledgements = [];
+  let goal = null;
+  const ctx = {
+    get: service => service === 'agents' ? { get: id => ({ session: { id, snapshotEvents: () => records } }) } : undefined,
+    typertGateway: {
+      async invoke(call) {
+        assert.equal(call.namespace, 'goals');
+        assert.equal(call.args.agentId, sessionId);
+        rpc.push(call);
+        if (call.method === 'get') return goal;
+        assert.equal(call.method, 'create');
+        goal = { ...call.args.request, id: 'inline-goal', revision: 1, phase: 'active', activation: 'armed', roundsStarted: 0 };
+        records.push({ type: 'goal/change', seq: 41, data: { operation: 'create', goal } });
+        return { ref: { id: goal.id, revision: goal.revision } };
+      },
+      stream() { assert.fail('the local Fast Command needs no stream'); },
+    },
+  };
+  connection = harnessConnection(ctx);
+  const harness = new DiscordHarnessClient({
+    ...connection, workspace: dir, autostart: false, commandExecutor: createHarnessCommandExecutor(ctx),
+  });
+  const { promise: confirmed, resolve: confirm } = Promise.withResolvers();
+  const listeners = new Map();
+  const receive = packet => listeners.get('message')({ data: JSON.stringify(packet) });
+  const socket = {
+    readyState: 1,
+    addEventListener: (name, fn) => listeners.set(name, fn),
+    send(raw) {
+      if (JSON.parse(raw).op === 2) queueMicrotask(() => receive({ op: 0, t: 'READY', d: { session_id: 's' } }));
+    },
+    close() {},
+  };
+  runtime = new DiscordRuntime({
+    config: { platformId: app, botId: 'test' }, token: 'test', accessPolicy: policy,
+    ...createBotWorkspaceScope(harness, { botId: 'test', workspaces, state }),
+    createApi: () => ({
+      getCurrentUser: async () => ({ id: app, bot: true }),
+      getGatewayBot: async () => ({ url: 'wss://gateway.discord.gg' }),
+      respondInteraction: async args => {
+        acknowledgements.push(args);
+        if (args.type === 9) confirm({ kind: 'modal' });
+      },
+      editOriginalInteraction: async args => { confirm({ kind: 'interaction-edit', ...args }); return { id: 'confirmation' }; },
+      createMessage: async args => { confirm({ kind: 'message', ...args }); return { id: 'confirmation' }; },
+    }),
+    createWebSocket: () => {
+      queueMicrotask(() => receive({ op: 10, d: { heartbeat_interval: 45_000 } }));
+      return socket;
+    },
+  });
+  await runtime.start();
+  const objective = '完成当前报告';
+  receive({ op: 0, t: 'INTERACTION_CREATE', d: { ...event,
+    data: { name: 'goal', type: 1, options: [{ name: 'objective', type: 3, value: objective }] },
+  } });
+  const confirmation = await confirmed;
+  assert.deepEqual(acknowledgements.map(ack => ack.type), [4]);
+  assert.equal(acknowledgements[0].data.flags, 64);
+  assert.equal(confirmation.kind, 'message');
+  assert.equal(confirmation.channelId, event.channel_id);
+  assert.equal(confirmation.components, undefined);
+  assert.ok(confirmation.content.includes(objective));
+  assert.deepEqual(rpc.map(call => call.method), ['get', 'create', 'get']);
+  assert.deepEqual(rpc[1].args.request, { objective, maxGoalRounds: 256 });
+  const restored = await new DiscordStateStore(statePath).load();
+  const route = restored.goalOutputRouteFor(key);
+  assert.equal(route.sessionId, sessionId);
+  assert.equal(route.actor, actor);
+  assert.equal(route.goalId, 'inline-goal');
+  assert.equal(route.goalStartSeq, 41);
 });
 
 test('native multi select is bounded and has exact index identity', () => {

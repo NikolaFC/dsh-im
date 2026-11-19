@@ -16,7 +16,7 @@ export async function discordCommandChoices(command, harness, state, key, signal
     const goal = status?.goal;
     const bound = typeof state?.sessionFor === 'function' && Boolean(state.sessionFor(key));
     const choices = [{ label: '查看目标状态', command: '/goal status' }];
-    if (!goal || goal.phase === 'complete') choices.push({ label: '创建目标（填写说明）', command: '/goal create' });
+    if (!goal || goal.phase === 'complete') choices.push({ label: '创建目标（弹出表单填写）', command: '/goal create' });
     if (goal?.phase === 'active') choices.push({ label: '暂停自动续轮', command: '/goal pause' });
     if (goal && goal.phase !== 'complete' && goal.roundsStarted < goal.maxGoalRounds
       && (goal.phase !== 'active' || goal.activation !== 'armed')) choices.push({ label: '恢复自动续轮', command: '/goal resume' });

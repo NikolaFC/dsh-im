@@ -146,6 +146,7 @@ function sessionSyncState(value, available) {
 
 export class DeliveryService {
   #adapters = new Map();
+  #discordGoalRegistrations = new WeakMap();
   #unavailableSessionSyncChannels;
   #logger;
   dsBot;
@@ -455,6 +456,52 @@ export class DeliveryService {
     if (outcome === 'unavailable') await notify(true);
     else await notify();
     return false;
+  }
+
+  /** Look up Goal authority independently of the generic Session sync settings. */
+  async resolveDiscordGoalRoute(sessionId) {
+    const registration = this.#adapters.get('discord');
+    if (typeof sessionId !== 'string' || !sessionId || this.#unavailableSessionSyncChannels.has('discord')
+      || typeof registration?.adapter.listDiscordGoalRoutes !== 'function') return null;
+    let routes;
+    try {
+      routes = await registration.adapter.listDiscordGoalRoutes(sessionId);
+    } catch {
+      return { ambiguous: true };
+    }
+    if (this.#adapters.get('discord') !== registration || !Array.isArray(routes) || routes.length > 1) {
+      return { ambiguous: true };
+    }
+    if (routes.length === 0) return null;
+    const route = Object.freeze(routes[0]);
+    this.#discordGoalRegistrations.set(route, registration);
+    return route;
+  }
+
+  async deliverDiscordGoalText(route, endSeq, text, { signal, assertGoalCurrent } = {}) {
+    const registration = this.#discordGoalRegistrations.get(route);
+    if (!registration || this.#adapters.get('discord') !== registration
+      || typeof registration.adapter.deliverDiscordGoalText !== 'function' || signal?.aborted
+      || !Number.isSafeInteger(endSeq) || endSeq <= route.deliverySeqCursor
+      || endSeq <= route.deliverySeqFloor || typeof text !== 'string' || !text.trim()) return false;
+    const deliverySignal = signal
+      ? AbortSignal.any([registration.controller.signal, signal]) : registration.controller.signal;
+    const validate = async () => {
+      if (deliverySignal.aborted) return false;
+      const current = await this.resolveDiscordGoalRoute(route.sessionId);
+      return !deliverySignal.aborted && current?.routeId === route.routeId
+        && current?.botId === route.botId && current?.conversationKey === route.conversationKey
+        && current?.bindingVersion === route.bindingVersion;
+    };
+    try {
+      return await registration.adapter.deliverDiscordGoalText(route, endSeq, text, {
+        signal: deliverySignal, validate, assertGoalCurrent,
+      });
+    } catch (error) {
+      if (error?.code === 'send-result-unknown') throw publicOperationError(error);
+      if (deliverySignal.aborted || error?.name === 'AbortError') throw deliveryError('cancelled', 'Request cancelled', { cause: error });
+      throw publicOperationError(error);
+    }
   }
 
   async sendSessionSyncText(botId, targetId, sessionId, text, { signal, format = 'plain' } = {}) {

@@ -305,6 +305,11 @@ function stateSessions(state) {
   return sessions && typeof sessions === 'object' && !Array.isArray(sessions) ? sessions : null;
 }
 
+function sameGoalOutputRoute(current, expected) {
+  return current && ['routeId', 'bindingVersion', 'sessionId', 'actor', 'goalId',
+    'revision', 'goalStartSeq', 'deliverySeqFloor'].every(key => current[key] === expected[key]);
+}
+
 function sessionSyncView(channel, target, sessions, configured) {
   if (configured) {
     const valid = conversationKeyMatchesTarget(channel, configured.conversationKey, target);
@@ -625,6 +630,40 @@ export function createDeliveryAdapter({
     },
     async presentSessionSyncQuestion(botId, targetId, sessionId, interaction, options = {}) {
       return presentSyncInteraction('presentSessionSyncQuestion', botId, targetId, sessionId, interaction, options);
+    },
+    async listDiscordGoalRoutes(sessionId) {
+      if (channel !== 'discord') return [];
+      const routes = [];
+      for (const botId of workspaces.listBotIds()) {
+        const state = await stateFor(botId);
+        for (const [conversationKey, boundSessionId] of Object.entries(stateSessions(state) ?? {})) {
+          if (boundSessionId !== sessionId || !/^(?:direct|group):\d{5,30}$/u.test(conversationKey)
+            || workspaces.dsBotBindingFor?.(botId, conversationKey)) continue;
+          const authority = state.goalOutputRouteFor?.(conversationKey);
+          if (authority?.sessionId === sessionId) routes.push({ ...authority, botId, conversationKey });
+        }
+      }
+      return routes;
+    },
+    async deliverDiscordGoalText(route, endSeq, text, { signal, validate, assertGoalCurrent } = {}) {
+      if (channel !== 'discord' || !workspaces.has(route.botId)
+        || typeof coreController.sendDiscordGoalText !== 'function') return false;
+      const { botId, conversationKey } = route;
+      const incarnation = workspaces.incarnationFor?.(botId);
+      const state = await stateFor(botId);
+      const isCurrent = () => !signal?.aborted && workspaces.has(botId)
+        && incarnation === workspaces.incarnationFor?.(botId)
+        && !workspaces.dsBotBindingFor?.(botId, conversationKey)
+        && state.sessionFor(conversationKey) === route.sessionId
+        && sameGoalOutputRoute(state.goalOutputRouteFor?.(conversationKey), route);
+      if (!isCurrent() || typeof state.claimGoalOutput !== 'function') return false;
+      return coreController.sendDiscordGoalText(botId, route, text, {
+        signal,
+        assertGoalCurrent,
+        validate,
+        isRouteCurrent: isCurrent,
+        claim: () => isCurrent() && state.claimGoalOutput(conversationKey, route, endSeq),
+      });
     },
     async sendSessionSyncText(botId, targetId, sessionId, text, options = {}) {
       if (typeof text !== 'string' || !text.trim()) throw new TypeError('text is required');
