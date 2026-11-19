@@ -109,19 +109,22 @@ export function createImHostPlugin(internals = {}) {
         unavailableSessionSyncChannels: unavailableSessionSyncChannels.map((channel) => channel === 'wecomApp' ? 'wecom-app' : channel),
         dsBot: createDsBotClient(ctx),
       });
-      // The delivery switches are the master for everything that follows a Session
-      // through its targets: with both off, `listSessionSyncTargets` answers empty,
-      // so neither the coordinator nor a channel's own mirror (Feishu card) sends.
-      // A settings read failure must not disable delivery, so it falls through.
+      // The global switches govern mirrored text and the existing interaction
+      // routes. An explicitly synced Discord group can get its own question
+      // without enabling either global text switch.
       if (typeof deliveryService.listSessionSyncTargets === 'function') {
         const rawListSessionSyncTargets = deliveryService.listSessionSyncTargets.bind(deliveryService);
-        deliveryService.listSessionSyncTargets = async (sessionId) => {
+        deliveryService.listSessionSyncTargets = async (sessionId, options) => {
           try {
-            if (deliverySwitchesOff(await getDeliverySyncSettingsStore(config).get())) return [];
+            if (deliverySwitchesOff(await getDeliverySyncSettingsStore(config).get())) {
+              return options?.question === true
+                ? rawListSessionSyncTargets(sessionId, { question: true, discordGroupQuestionsOnly: true })
+                : [];
+            }
           } catch {
             // keep the unwrapped behaviour
           }
-          return rawListSessionSyncTargets(sessionId);
+          return rawListSessionSyncTargets(sessionId, options);
         };
       }
       /** Sessions already reported, so the log stays one line per session. */

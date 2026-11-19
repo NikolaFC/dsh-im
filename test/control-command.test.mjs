@@ -148,6 +148,18 @@ test('/steer never reaches Harness while an interaction is pending', async () =>
   assert.equal(calls.length, 0);
 });
 
+test('/steer explains a question pending only on the Host', async () => {
+  const { state } = fixture();
+  const harness = { workspaceSession: () => ({
+    async steerActiveTurn() {
+      throw Object.assign(new Error('waiting for question'), { code: 'harness-question-pending' });
+    },
+  }) };
+  const result = await runControlCommand('/steer continue', harness, state, 'direct:one');
+  assert.match(result.message, /等待你的回答或审批/);
+  assert.match(result.message, /\/stop/);
+});
+
 test('/steer reports a lost active-turn race instead of starting new work', async () => {
   const { harness, state, calls } = fixture({ steered: false });
   const result = await runControlCommand('/steer continue', harness, state, 'direct:one', {

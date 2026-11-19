@@ -371,16 +371,19 @@ export function createDeliveryAdapter({
     const { conversationKey } = await syncTarget(botId, targetId, sessionId, options);
     return { conversationKey };
   };
+  const questionRouteOptions = { allowParts: false, privateOnly: channel !== 'discord' };
   const presentSyncInteraction = async (method, botId, targetId, sessionId, interaction, options = {}) => {
-    // Text from an old part may finish delivery, but a new question answer must
-    // still belong to the Bot's current session, and both interactions stay
-    // private-chat only.
-    const routeOptions = { allowParts: method !== 'presentSessionSyncQuestion', privateOnly: true };
+    const question = method === 'presentSessionSyncQuestion';
+    const routeOptions = question ? questionRouteOptions : { privateOnly: true };
     const original = await syncTarget(botId, targetId, sessionId, routeOptions);
     if (typeof coreController[method] !== 'function') return false;
+    const state = channel === 'discord' && question ? await stateFor(botId) : null;
+    const bindingVersion = state?.controlBindingVersion?.(original.conversationKey);
+    const author = state?.authorFor?.(original.conversationKey);
     const validate = async () => {
       const current = await syncTarget(botId, targetId, sessionId, routeOptions);
       if (current.conversationKey !== original.conversationKey || current.dsBotId !== original.dsBotId
+        || (state && state.controlBindingVersion?.(original.conversationKey) !== bindingVersion)
         || options.signal?.aborted) throw sessionSyncUnavailable('The interaction route changed or ended');
     };
     const guarded = {
@@ -398,6 +401,7 @@ export function createDeliveryAdapter({
     };
     return coreController[method](botId, original.target, guarded, {
       ...options, key: original.conversationKey, validate,
+      ...(author?.isBot === false && author.senderId ? { actor: author.senderId } : {}),
     });
   };
   return Object.freeze({
@@ -581,17 +585,19 @@ export function createDeliveryAdapter({
       await workspaces.setDeliveryTargetSessionSync(botId, targetId, conversationKey);
       return { enabled: true, state: 'active' };
     },
-    async listSessionSyncTargets(sessionId) {
+    async listSessionSyncTargets(sessionId, { question = false, discordGroupQuestionsOnly = false } = {}) {
       if (typeof sessionId !== 'string' || !sessionId) {
         throw new TypeError('sessionId is required');
       }
       const matches = [];
       for (const configured of configuredSessionSyncTargets(workspaces)) {
+        if (discordGroupQuestionsOnly && (channel !== 'discord'
+          || configured.dsBotId || !configured.conversationKey.startsWith('group:'))) continue;
         const target = sessionSyncTarget(channel, workspaces, configured);
-        // Listed targets are the candidate range of synced questions and
-        // approvals only, so a non-private route never appears here even
-        // though mirrored text may be delivered to it.
-        if (!target || !privateConversationKeyMatchesTarget(
+        // Only an explicitly synced Discord question can use a group/thread.
+        const matchesRoute = question && channel === 'discord'
+          ? conversationKeyMatchesTarget : privateConversationKeyMatchesTarget;
+        if (!target || !matchesRoute(
           channel,
           configured.conversationKey,
           target,
@@ -610,12 +616,10 @@ export function createDeliveryAdapter({
       }
       return matches;
     },
-    // Both interaction paths resolve their target through the private-only gate,
-    // so a synced group or topic is never offered a question or an approval.
     describeSessionSyncApprovalTarget: (botId, targetId, sessionId) =>
       describeSyncTarget(botId, targetId, sessionId, { privateOnly: true }),
     describeSessionSyncQuestionTarget: (botId, targetId, sessionId) =>
-      describeSyncTarget(botId, targetId, sessionId, { privateOnly: true }),
+      describeSyncTarget(botId, targetId, sessionId, questionRouteOptions),
     async presentSessionSyncApproval(botId, targetId, sessionId, interaction, options = {}) {
       return presentSyncInteraction('presentSessionSyncApproval', botId, targetId, sessionId, interaction, options);
     },

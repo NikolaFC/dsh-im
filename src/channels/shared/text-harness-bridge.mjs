@@ -1033,7 +1033,7 @@ export class TextHarnessBridge {
       );
       if (result?.stopped) {
         await Promise.allSettled([
-          this.#cancelPendingInteraction(key),
+          this.#cancelPendingInteraction(key, { includeSynced: true }),
           this.#approvals.closeRoute(key),
         ]);
       }
@@ -1732,9 +1732,10 @@ export class TextHarnessBridge {
       return;
     }
     const current = this.#pendingInteractions.get(key);
+    const cardReply = typeof resolveAnswer === 'function';
     const claimed = expected.claimedReplyMessageId === messageId;
     if (!current || current !== expected || current.submitting) {
-      if (claimed && (!current || current !== expected)) {
+      if (cardReply || (claimed && (!current || current !== expected))) {
         return this.#discardResolvedInteractionReply(message, messageId);
       }
       return this.#enqueueMessage(message, messageId, senderId, key, {
@@ -1768,7 +1769,7 @@ export class TextHarnessBridge {
 
     const pending = this.#pendingInteractions.get(key);
     if (!pending || pending !== expected || pending.submitting) {
-      if (claimed && (!pending || pending !== expected)) {
+      if (cardReply || (claimed && (!pending || pending !== expected))) {
         return this.#discardResolvedInteractionReply(message, messageId, {
           alreadyRecorded: true,
         });
@@ -1777,6 +1778,16 @@ export class TextHarnessBridge {
         releaseMessageId: false,
         alreadyRecorded: true,
       });
+    }
+    if (pending.synced) {
+      try {
+        await pending.synced.validate();
+      } catch {
+        pending.synced.retire();
+      }
+      if (this.#pendingInteractions.get(key) !== pending) {
+        return this.#discardResolvedInteractionReply(message, messageId, { alreadyRecorded: true });
+      }
     }
     pending.target = target;
     if (pending.needsPresentation) {
@@ -1795,7 +1806,7 @@ export class TextHarnessBridge {
       }
       const presented = this.#pendingInteractions.get(key);
       if (!presented || presented !== expected || presented.submitting) {
-        if (claimed && (!presented || presented !== expected)) {
+        if (cardReply || (claimed && (!presented || presented !== expected))) {
           return this.#discardResolvedInteractionReply(message, messageId, {
             alreadyRecorded: true,
           });
@@ -1844,6 +1855,16 @@ export class TextHarnessBridge {
 
     pending.submitting = true;
     try {
+      if (pending.synced) {
+        try {
+          await pending.synced.validate();
+        } catch (cause) {
+          pending.synced.retire();
+          throw Object.assign(new Error('Synced question route is no longer available', { cause }), {
+            code: 'interaction-not-pending',
+          });
+        }
+      }
       await pending.interaction.respond({
         ok: true,
         value: {
@@ -2206,11 +2227,44 @@ export class TextHarnessBridge {
     });
   }
 
+  async presentSessionSyncQuestion(interaction, context, { signal, completion } = {}) {
+    const { key, validate } = context;
+    const interactionId = cleanText(interaction?.interactionId) || cleanText(interaction?.rpcId);
+    if (!interactionId || signal?.aborted || this.#signal?.aborted
+      || this.#pendingInteractions.has(key)) return false;
+    const retire = (withdraw = true) => {
+      signal?.removeEventListener('abort', onAbort);
+      this.#signal?.removeEventListener('abort', onAbort);
+      const pending = this.#takePendingInteraction(key, interactionId);
+      if (!pending) return;
+      if (withdraw) void Promise.resolve().then(() => interaction.withdraw?.()).catch((error) => {
+        this.#logger.warn?.(`[dsh-im:${this.#descriptor.key}] could not withdraw a synced question:`, error?.code ?? error?.name);
+      });
+      void this.#retireInteractionCard(pending.target, pending.cardMessageId);
+    };
+    const onAbort = () => retire();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    this.#signal?.addEventListener('abort', onAbort, { once: true });
+    if (completion) void Promise.resolve(completion).then(() => retire(false), () => retire(false));
+    try {
+      const pending = await this.#handleInteraction(interaction, {
+        ...context, synced: { validate, retire },
+      });
+      if (pending) return true;
+      retire();
+      return false;
+    } catch (error) {
+      retire();
+      throw error;
+    }
+  }
+
   async #handleInteraction(interaction, {
     key,
     actor,
     target,
     requiresMention,
+    synced,
   }) {
     if (interaction?.kind === 'approval') {
       const send = (text) => this.#bot.sendText(target, text);
@@ -2309,6 +2363,7 @@ export class TextHarnessBridge {
       answers: [],
       index: 0,
       target,
+      synced,
       queue: null,
       claimedReplyMessageId: null,
       submitting: false,
@@ -2323,6 +2378,7 @@ export class TextHarnessBridge {
     this.#pendingInteractions.set(key, pending);
     this.#interactionKeys.set(interactionId, key);
     await this.#presentInteraction(pending);
+    return pending;
   }
 
   async #handleInteractionResolved(resolution) {
@@ -2366,6 +2422,10 @@ export class TextHarnessBridge {
     const question = pending.questions[pending.index];
     if (!question) return Promise.resolve();
     const task = (async () => {
+      if (pending.synced) {
+        await pending.synced.validate();
+        if (!this.#interactionKeys.has(pending.interactionId)) return;
+      }
       // A fresh nonce per presentation: a later question restarts its indexes at
       // zero, so without one an old card's keyboard would answer the new question.
       pending.cardNonce = randomUUID().slice(0, 8);
@@ -2377,6 +2437,9 @@ export class TextHarnessBridge {
             markup: card.markup,
           });
           pending.cardMessageId = sent?.providerMessageIds?.at(-1) ?? null;
+          if (pending.synced && !this.#interactionKeys.has(pending.interactionId)) {
+            await this.#retireInteractionCard(pending.target, pending.cardMessageId);
+          }
           pending.needsPresentation = false;
           return;
         } catch (error) {
@@ -2389,6 +2452,10 @@ export class TextHarnessBridge {
             error?.message ?? error,
           );
         }
+      }
+      if (pending.synced) {
+        await pending.synced.validate();
+        if (!this.#interactionKeys.has(pending.interactionId)) return;
       }
       await this.#bot.sendText(
         pending.target,
@@ -2456,7 +2523,12 @@ export class TextHarnessBridge {
     }
   }
 
-  async #cancelPendingInteraction(key) {
+  async #cancelPendingInteraction(key, { includeSynced = false } = {}) {
+    const current = this.#pendingInteractions.get(key);
+    if (current?.synced) {
+      if (includeSynced) current.synced.retire();
+      return;
+    }
     const pending = this.#takePendingInteraction(key);
     if (!pending || pending.kind !== 'question') return;
     try {

@@ -10,6 +10,14 @@ const VERSION_USAGE = '用法：/version（不带参数）';
 const STEER_USAGE = '用法：/steer <补充指令>';
 const TEXT_ONLY = '控制命令仅支持纯文字，请移除图片后重试。';
 
+function pendingInteractionMessage() {
+  return [
+    t('当前任务正在等待你的回答或审批。'),
+    '',
+    t('请先处理当前请求，或者发送 /stop 停止任务。'),
+  ].join('\n');
+}
+
 function commandResult(message, extra = {}) {
   return { message, ...extra };
 }
@@ -97,13 +105,7 @@ export async function runControlCommand(text, harness, state, key, {
   const match = /^\/steer(?:\s+([\s\S]*))?$/iu.exec(command);
   const instruction = match?.[1]?.trim() ?? '';
   if (!instruction) return commandResult(t(STEER_USAGE));
-  if (pendingInteraction) {
-    return commandResult([
-      t('当前任务正在等待你的回答或审批。'),
-      '',
-      t('请先处理当前请求，或者发送 /stop 停止任务。'),
-    ].join('\n'));
-  }
+  if (pendingInteraction) return commandResult(pendingInteractionMessage());
 
   const session = boundSession(harness, state, key);
   if (!session) {
@@ -111,9 +113,15 @@ export async function runControlCommand(text, harness, state, key, {
   }
   // A mid-turn correction carries the same provenance as the message that
   // opened the turn, so a group member who steers is identified too.
-  const steered = await steerMessage(instruction, harness, state, key, {
-    signal, control, enhancement,
-  });
+  let steered;
+  try {
+    steered = await steerMessage(instruction, harness, state, key, {
+      signal, control, enhancement,
+    });
+  } catch (error) {
+    if (error?.code === 'harness-question-pending') return commandResult(pendingInteractionMessage());
+    throw error;
+  }
   return steered
     ? commandResult(t('已提交补充指令，Agent 会在下一步读取。'))
     : commandResult(t('任务已结束，没有正在运行的任务，无法补充指令。请直接发送消息开始新任务。'));

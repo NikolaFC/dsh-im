@@ -90,3 +90,27 @@ test('shutdown releases accepted messages without submitting or enqueueing pendi
   assert.equal(f.calls.filter(([op]) => op === 'queue').length, 0);
   assert.equal(f.acceptedMessageIds.size, 0);
 });
+
+test('a Host-only pending question queues the message once and explains the wait', async () => {
+  const f = fixture();
+  const task = f.dispatch('one', {
+    isQueued: () => false,
+    harness: {
+      currentBusyMessageMode: () => 'steer',
+      workspaceSession: () => ({
+        steerActiveTurn: async () => {
+          throw Object.assign(new Error('waiting for question'), { code: 'harness-question-pending' });
+        },
+      }),
+    },
+  });
+  await tick();
+  assert.equal(f.options.state.hasSeen('one'), true);
+  assert.deepEqual(f.calls, [
+    ['queue', true],
+    ['reply', '当前任务正在等待你的回答或审批。\n已排队，等待前序消息处理。'],
+  ]);
+  f.turn.resolve();
+  await task;
+  assert.equal(f.acceptedMessageIds.size, 0);
+});

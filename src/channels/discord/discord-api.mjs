@@ -536,6 +536,8 @@ export class DiscordApi {
       method: 'POST',
       signal,
       expectBody: false,
+      retry: false,
+      preserveRetryAfterHeader: true,
     });
   }
 
@@ -577,6 +579,7 @@ export class DiscordApi {
     retry = true,
     multipart = false,
     auditReason,
+    preserveRetryAfterHeader = false,
   }) {
     if (signal?.aborted) throw abortReason(signal);
     let auditHeader;
@@ -629,7 +632,18 @@ export class DiscordApi {
       if (Number.isInteger(parsed?.code) || typeof parsed?.code === 'string') {
         error.providerCode = parsed.code;
       }
-      const retryAfter = Number(parsed?.retry_after);
+      let retryAfter = Number(parsed?.retry_after);
+      if (response.status === 429 && preserveRetryAfterHeader) {
+        const header = response.headers?.get?.('retry-after')?.trim();
+        if (header) {
+          const seconds = /^\d+(?:\.\d+)?$/.test(header)
+            ? Number(header)
+            : Math.max(0, (Date.parse(header) - Date.now()) / 1_000);
+          if (Number.isFinite(seconds) && seconds >= 0) {
+            retryAfter = Math.max(Number.isFinite(retryAfter) ? retryAfter : 0, seconds);
+          }
+        }
+      }
       if (Number.isFinite(retryAfter) && retryAfter >= 0) {
         error.retry_after = retryAfter;
         error.retryAfter = retryAfter;

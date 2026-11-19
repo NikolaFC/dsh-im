@@ -37,12 +37,15 @@ export class BusyMessageDispatcher {
       logger.error?.('[dsh-im] failed to route a message:', messageFailureDiagnostic(error, failure));
       await Promise.resolve().then(() => send(messageFailureText(failure))).catch(() => undefined);
     };
-    const queue = (alreadyRecorded = false) => {
+    const queue = (alreadyRecorded = false, waitingForQuestion = false) => {
       const waiting = isQueued();
       // Reserve FIFO position before sending the optional receipt.
       const completion = enqueue({ alreadyRecorded });
-      const receipt = waiting
-        ? Promise.resolve().then(() => send(t('已排队，等待前序消息处理。'))).catch((error) => {
+      const receipt = waiting || waitingForQuestion
+        ? Promise.resolve().then(() => send([
+          ...(waitingForQuestion ? [t('当前任务正在等待你的回答或审批。')] : []),
+          t('已排队，等待前序消息处理。'),
+        ].join('\n'))).catch((error) => {
             logger.warn?.('[dsh-im] failed to send queue receipt:', error);
           })
         : Promise.resolve();
@@ -56,9 +59,15 @@ export class BusyMessageDispatcher {
       status.messagesReceived = (status.messagesReceived ?? 0) + 1;
       status.lastMessageAt = new Date().toISOString();
       signal?.throwIfAborted();
-      const submitted = await steerMessage(text, harness, state, key, {
-        signal, control, enhancement, pendingInteraction: pendingInteraction(),
-      });
+      let submitted;
+      try {
+        submitted = await steerMessage(text, harness, state, key, {
+          signal, control, enhancement, pendingInteraction: pendingInteraction(),
+        });
+      } catch (error) {
+        if (error?.code === 'harness-question-pending') return queue(true, true);
+        throw error;
+      }
       if (!submitted) return queue(true);
       // Submission is final even if its receipt fails.
       await send(t('已提交补充指令，Agent 会在下一步读取。'));

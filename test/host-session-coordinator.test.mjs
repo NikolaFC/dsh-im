@@ -7,6 +7,7 @@ import test from 'node:test';
 import {
   createHarnessSessionExecutors,
 } from '../plugin-src/host/harness-session-coordinator.mjs';
+import { modernHarnessApi } from '../plugin-src/host/modern-harness-api.mjs';
 import { assertPathMatches } from './support/filesystem.mjs';
 
 function contextWith(registry) {
@@ -87,6 +88,61 @@ test('Host control executor reads modern Session event snapshots', () => {
     action: 'stop',
   }), true);
   assert.deepEqual(calls, [['cancel', { kind: 'user' }, { keepInbox: true }]]);
+});
+
+test('Host steering refuses a cancelled loop while its turn is still open', () => {
+  const abort = new AbortController();
+  const { agent, calls } = liveAgent({
+    phase: { kind: 'running', abort },
+    cancel() { abort.abort(); },
+  });
+  const { controlExecutor } = createHarnessSessionExecutors(contextWith({ get: () => agent }));
+  const control = { sessionId: 'session-one', boundSession: () => true };
+  const request = { action: 'steer', inputRpcId: 'running-steer', text: 'a follow-up' };
+  assert.equal(controlExecutor({ ...control, ...request }), true);
+  assert.equal(controlExecutor({ ...control, action: 'stop' }), true);
+  assert.equal(agent.status, 'running', 'the host has not unwound the turn yet');
+  assert.equal(controlExecutor({ ...control, ...request }), false);
+  assert.equal(controlExecutor({
+    sessionId: 'session-one', expectedTurn: 7, promptRpcId: 'prompt-owned', ...request,
+  }), false);
+  assert.equal(calls.length, 1);
+});
+
+test('Host steering preserves native questions when no IM route is available', async (t) => {
+  const { agent, calls } = liveAgent();
+  agent.session.id = 'session-one';
+  const listeners = new Map();
+  const ctx = {
+    ...contextWith({ get: () => agent }),
+    root: {},
+    typertGateway: { invoke() {}, stream() {} },
+    on(type, listener) {
+      listeners.set(type, listener);
+      return () => listeners.delete(type);
+    },
+  };
+  const api = modernHarnessApi(ctx, {
+    deliveryService: { presentSessionSyncQuestion: async () => false },
+  });
+  t.after(() => api.dispose());
+  const { controlExecutor } = createHarnessSessionExecutors(ctx);
+  const request = { sessionId: agent.session.id, boundSession: () => true,
+    action: 'steer', inputRpcId: 'running-steer', text: 'a follow-up' };
+  const controller = new AbortController();
+  let resolveNative;
+  const native = new Promise((resolve) => { resolveNative = resolve; });
+  const question = listeners.get('user-questions/request')({
+    agent, questions: [{ id: 'choice', question: 'Continue?' }], signal: controller.signal,
+  }, () => native);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.throws(() => controlExecutor(request), { code: 'harness-question-pending' });
+  assert.equal(calls.length, 0, 'an ordinary message must not enter the waiting turn');
+  const answer = { answers: [{ id: 'choice', selected: [], custom: 'yes' }] };
+  resolveNative(answer);
+  assert.deepEqual(await question, answer);
+  assert.equal(controlExecutor(request), true);
+  assert.equal(calls.length, 1);
 });
 
 test('Host control executor refuses idle, replaced, closed, and foreign turns without waking', () => {

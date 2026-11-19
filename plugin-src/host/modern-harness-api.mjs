@@ -306,6 +306,13 @@ class ModernHarnessApi {
     if (service) this.#deliveryService = service;
   }
 
+  hasPendingQuestion(sessionId) {
+    for (const pending of this.#pendingQuestions.values()) {
+      if (pending.sessionId === sessionId && !pending.signal?.aborted) return true;
+    }
+    return false;
+  }
+
   async #invoke(namespace, method, args, signal) {
     return this.#gateway.invoke(remoteRequest(namespace, method, args, signal, this.#peer));
   }
@@ -954,6 +961,10 @@ class ModernHarnessApi {
     );
     for (const dispose of this.#disposers.splice(0).reverse()) dispose?.();
   }
+}
+
+export function hasPendingHarnessQuestion(ctx, sessionId) {
+  return modernApis.get(ctx?.root ?? ctx)?.hasPendingQuestion(sessionId) === true;
 }
 
 /** Create one modern compatibility API per Cordis Host root. */

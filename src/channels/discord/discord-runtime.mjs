@@ -11,12 +11,14 @@ import { evaluateInboundAccess } from '../shared/inbound-access.mjs';
 import { formatThinkingLine, formatToolTrace } from '../shared/thinking-trace.mjs';
 import { registerLiveSegmentBot } from '../shared/session-sync-registry.mjs';
 import { DiscordApi } from './discord-api.mjs';
+import { discordTypingRetryAfterMs } from './typing-error.mjs';
 import { PICKER_COMMANDS, discordCommandChoices, DiscordCommandPickers, boundedDiscordContent } from './discord-command-picker.mjs';
 import { discordCardComponents, normalizeDiscordInteraction, syncDiscordCommands } from './discord-interactions.mjs';
 import { createDiscordBridgeStatus, DiscordHarnessBridge } from './discord-bridge.mjs';
 
 const DISCORD_GATEWAY_INTENTS = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15);
 const THREAD_RECOVERY_TIMEOUT_MS = 5_000;
+const TYPING_INTERVAL_MS = 7_500;
 const RECONNECT_DELAYS_MS = Object.freeze([1_000, 3_000, 5_000, 10_000, 30_000]);
 const GUILD_TEXT = 0;
 const GUILD_ANNOUNCEMENT = 5;
@@ -523,14 +525,28 @@ export class DiscordBotClient {
     const channelId = target.channelId;
     const at = this.#now();
     const previous = this.#typing.get(channelId);
-    if (previous?.pending || at - (previous?.at ?? -Infinity) < 7_500) return Promise.resolve({ sent: false, lastPulseAt: previous.at });
-    for (const [id, row] of this.#typing) if (!row.pending && at - row.at >= 7_500) this.#typing.delete(id);
-    const row = { at, pending: true };
+    if (previous && (previous.pending || at - previous.at < TYPING_INTERVAL_MS || at < previous.retryAt)) {
+      return Promise.resolve({
+        sent: false,
+        lastPulseAt: previous.at,
+        ...(previous.retryAt > previous.at + TYPING_INTERVAL_MS ? { nextPulseAt: previous.retryAt } : {}),
+      });
+    }
+    for (const [id, row] of this.#typing) {
+      if (!row.pending && at - row.at >= TYPING_INTERVAL_MS && at >= row.retryAt) this.#typing.delete(id);
+    }
+    const row = { at, pending: true, retryAt: -Infinity };
     this.#typing.set(channelId, row);
     const timeout = AbortSignal.timeout(5_000);
     const signal = this.#signal ? AbortSignal.any([this.#signal, timeout]) : timeout;
-    return Promise.resolve().then(() => this.#api.sendTyping({ channelId, signal }))
-      .then(() => ({ sent: true, lastPulseAt: at })).finally(() => { row.pending = false; });
+    return Promise.resolve().then(() => {
+      signal.throwIfAborted();
+      return this.#api.sendTyping({ channelId, signal });
+    }).then(() => ({ sent: true, lastPulseAt: at }), (error) => {
+      const delay = discordTypingRetryAfterMs(error);
+      if (delay !== undefined) row.retryAt = Math.min(Number.MAX_SAFE_INTEGER, this.#now() + delay);
+      throw error;
+    }).finally(() => { row.pending = false; });
   }
 
   sendFile(target, file) {
@@ -848,6 +864,38 @@ export class DiscordRuntime {
     return this.#bridge.presentSessionSyncApproval(interaction, {
       key: options.key, actor, validate: options.validate,
       send: (text) => this.sendProactiveText(target, text),
+    }, options);
+  }
+
+  async presentSessionSyncQuestion(target, interaction, options = {}) {
+    if (!this.#status.ready || !this.#bridge || options.signal?.aborted) return false;
+    const channelId = target?.route?.channelId;
+    if (target?.kind !== 'channel' || !channelId) return false;
+    const channel = await this.#api.getChannel({ channelId, signal: options.signal });
+    if (String(channel?.id ?? '') !== channelId) return false;
+    const direct = channel.type === 1 && channel.recipients?.length === 1;
+    const group = channel.type === GUILD_TEXT || channel.type === GUILD_ANNOUNCEMENT || isThreadChannel(channel);
+    if (!direct && !group) return false;
+    const kind = direct ? 'direct' : 'group';
+    if (options.key !== `${kind}:${channelId}`) return false;
+    const actor = direct ? channel.recipients[0]?.id : options.actor;
+    const canAnswer = () => Boolean(this.#accessPolicy && actor
+      && evaluateInboundAccess(this.#accessPolicy, {
+        conversationType: kind, senderIds: [actor], isCommand: false,
+      }).allowed);
+    if (!canAnswer()) return false;
+    return this.#bridge.presentSessionSyncQuestion(interaction, {
+      key: options.key,
+      actor,
+      target: { channelId },
+      requiresMention: group && !this.#mentionFree
+        && !(isThreadChannel(channel) && String(channel.owner_id) === this.#config.platformId),
+      validate: async () => {
+        await options.validate?.();
+        if (!canAnswer()) throw Object.assign(new Error('Discord question actor is no longer allowed'), {
+          code: 'interaction-not-pending',
+        });
+      },
     }, options);
   }
 

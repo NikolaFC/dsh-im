@@ -1,5 +1,50 @@
 import { mkdir, writeFile, rename } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import { classifyDiscordTypingError } from '../../src/channels/discord/typing-error.mjs';
+
+const PULSE_INTERVAL = 7_500;
+const MAX_TIMER_DELAY = 2 ** 31 - 1;
+
+// The subagent service publishes lifecycle edges on the tree root in newer
+// hosts. The running activation map is the source for hydrated membership and
+// external runs, which have no Agent of their own.
+function readActivations(subagents, agents) {
+  try {
+    const resident = subagents?.manager?.resident;
+    if (!(resident instanceof Map)) return { coverage: 'unavailable(manager-resident)' };
+    const owners = new Map(), external = new Set();
+    for (const [id, row] of resident) {
+      if (!row || !['local', 'external'].includes(row.kind) || row.childId !== id) {
+        return { coverage: 'unavailable(activation-shape)' };
+      }
+      if (row.root?.id && Array.isArray(row.ancestors)) {
+        if (row.ancestors[0] !== row.root.id
+          || row.ancestors.some(ancestor => typeof ancestor !== 'string' || !ancestor || ancestor === id)
+          || new Set(row.ancestors).size !== row.ancestors.length
+          || (row.kind === 'local' && row.handle?.agent?.id !== id)) {
+          return { coverage: 'unavailable(activation-shape)' };
+        }
+        if (agents.get(row.root.id) !== row.root) continue;
+        const liveAncestors = row.ancestors.filter(ancestor => {
+          if (ancestor === row.root.id) return true;
+          const parent = resident.get(ancestor);
+          return parent?.kind === 'local' && parent.root === row.root
+            && parent.handle?.agent && agents.get(ancestor) === parent.handle.agent;
+        });
+        if (row.kind === 'external') for (const ancestor of liveAncestors) external.add(ancestor);
+        else if (agents.get(id) === row.handle.agent) owners.set(id, liveAncestors);
+      } else if (row.parent?.id) {
+        if (agents.get(row.parent.id) !== row.parent) continue;
+        if (row.kind === 'external') external.add(row.parent.id);
+      } else {
+        return { coverage: 'unavailable(activation-shape)' };
+      }
+    }
+    return { coverage: 'live-manager', owners, external };
+  } catch {
+    return { coverage: 'unavailable(read-failed)' };
+  }
+}
 
 // One coalesced, atomic snapshot, never an unbounded queue/log. No task content.
 export function createTypingDiagnostics(path, logger = console) {
@@ -28,15 +73,16 @@ export function observeDiscordActivity(ctx, {
   clearTimeout: unschedule = globalThis.clearTimeout,
   now = Date.now,
 } = {}) {
-  const records = new Map(), lastPulse = new Map(), inFlight = new Set();
+  const records = new Map(), lastPulse = new Map(), retryNotBefore = new Map(), inFlight = new Set();
   const disposers = [], errors = [];
   let agents, jobs, subagents, timer = null, closed = false, attached = false;
   let reason = 'starting', externalCoverage = 'unavailable(missing-service)';
-  let busySessions = [], activeChannels = [];
+  let busySessions = [], activeChannels = [], lastFailure = null;
   const report = () => {
     try { diagnostics?.({ at: now(), pid: process.pid, attached, reason, externalCoverage,
       busySessions: busySessions.slice(0, 500), channels: activeChannels.slice(0, 500),
-      lastPulseAtByChannel: Object.fromEntries([...lastPulse].slice(-500)), errors: [...errors] }); } catch {}
+      lastPulseAtByChannel: Object.fromEntries([...lastPulse].slice(-500)), errors: [...errors],
+      lastFailure }); } catch {}
   };
   const error = (code) => {
     if (errors.at(-1) !== code) errors.push(code);
@@ -52,32 +98,43 @@ export function observeDiscordActivity(ctx, {
   if (!state?.snapshot || !state?.sessionFor) return unavailable('missing-state');
   if (typeof sendTyping !== 'function') return unavailable('missing-transport');
 
-  // Compatibility seam for the installed runtime: its public catalog's activity
-  // uses Session residency, but external activations have no local Session.
-  // Never infer liveness from durable catalog/history. Unknown shapes fail soft.
-  const liveExternal = () => {
-    const owners = new Set();
-    try {
-      const resident = subagents?.manager?.resident;
-      if (!(resident instanceof Map)) { externalCoverage = 'unavailable(manager-resident)'; return owners; }
-      for (const [id, row] of resident) {
-        if (!row || !['local', 'external'].includes(row.kind) || row.childId !== id || !row.parent?.id) {
-          externalCoverage = 'unavailable(activation-shape)'; return new Set();
-        }
-        if (row.kind === 'external' && agents.get(row.parent.id) === row.parent) owners.add(row.parent.id);
+  const parentsOf = (agent, owners, live) => {
+    if (owners?.has(agent.id)) return owners.get(agent.id);
+    if (typeof subagents?.rootOf === 'function') {
+      try {
+        const root = subagents.rootOf(agent);
+        if (root && root !== agent && live.get(root.id) === root) return [root.id];
+      } catch { /* Ordinary work survives unavailable subagent ownership. */ }
+    }
+    if (typeof agents.isOwnedBy === 'function') {
+      for (const candidate of live.values()) {
+        if (candidate !== agent && agents.isOwnedBy(agent.id, candidate)) return [candidate.id];
       }
-      externalCoverage = 'live-manager';
-    } catch { externalCoverage = 'unavailable(read-failed)'; return new Set(); }
-    return owners;
+    }
+    return [];
   };
   const channels = () => {
-    const busy = new Set(), externalOwners = liveExternal();
+    const activations = readActivations(subagents, agents);
+    externalCoverage = activations.coverage;
+    const busy = new Set(), live = new Map();
     for (const [id, record] of records) {
-      if (!record.running && !record.jobs.size && !record.external.size && !externalOwners.has(id)) continue;
-      let current = id;
-      const visited = new Set();
-      while (current && !visited.has(current)) {
-        visited.add(current); busy.add(current); current = records.get(current)?.parent;
+      if (agents.get(id) === record.agent) live.set(id, record.agent);
+      if (activations.external) record.external.clear();
+    }
+    const markBusy = (id) => {
+      const agent = live.get(id);
+      if (!agent || busy.has(id)) return;
+      busy.add(id);
+      for (const parent of parentsOf(agent, activations.owners, live)) markBusy(parent);
+    };
+    for (const [id, agent] of live) {
+      const hasJobs = typeof jobs?.list === 'function' && jobs.list(id)
+        .some(job => job.owner === id && ['running', 'stopping'].includes(job.status));
+      if (agent.status === 'running' || hasJobs || activations.external?.has(id)) markBusy(id);
+      if (!activations.external) {
+        for (const parent of records.get(id).external.values()) {
+          if (live.get(parent.id) === parent) { markBusy(parent.id); markBusy(id); }
+        }
       }
     }
     const result = new Set();
@@ -107,9 +164,13 @@ export function observeDiscordActivity(ctx, {
     if (closed) return;
     try { callback(...args); } catch { error('lifecycle-error'); close('lifecycle-error'); }
   };
+  const nextPulse = channelId => Math.max(
+    (lastPulse.get(channelId) ?? -Infinity) + PULSE_INTERVAL,
+    retryNotBefore.get(channelId) ?? -Infinity,
+  );
   const pulse = (channelId) => {
     if (closed || signal?.aborted || inFlight.has(channelId)) return;
-    if (now() - (lastPulse.get(channelId) ?? -Infinity) < 7_500) return;
+    if (now() < nextPulse(channelId)) return;
     lastPulse.set(channelId, now()); inFlight.add(channelId);
     Promise.resolve().then(() => {
       if (!closed && !signal?.aborted && channels().has(channelId)) return sendTyping({ channelId });
@@ -117,7 +178,18 @@ export function observeDiscordActivity(ctx, {
       // A legacy pulse may have preceded this timer: align to the real shared
       // transport clock instead of waiting another full 7.5s after a skip.
       if (Number.isFinite(result?.lastPulseAt)) lastPulse.set(channelId, result.lastPulseAt);
-    }).catch(() => error('typing-send-failed')).finally(() => {
+      if (Number.isFinite(result?.nextPulseAt)) retryNotBefore.set(channelId, result.nextPulseAt);
+    }).catch((cause) => {
+      if (closed || signal?.aborted) return;
+      const failure = classifyDiscordTypingError(cause);
+      if (failure.kind === 'abort') return;
+      const at = now();
+      if (Number.isFinite(failure.retryAfterMs)) {
+        retryNotBefore.set(channelId, Math.min(Number.MAX_SAFE_INTEGER, at + failure.retryAfterMs));
+      }
+      lastFailure = { at, channelId, ...failure };
+      error('typing-send-failed');
+    }).finally(() => {
       inFlight.delete(channelId);
       if (!closed) safely(reconcile)(); else report();
     });
@@ -128,58 +200,49 @@ export function observeDiscordActivity(ctx, {
     for (const id of next) pulse(id);
     stopTimer();
     // Prune retired channel timestamps; the transport owns cross-producer dedupe.
-    for (const [id, at] of lastPulse) if (!next.has(id) && now() - at >= 7_500) lastPulse.delete(id);
+    const at = now();
+    for (const [id, until] of retryNotBefore) if (until <= at) retryNotBefore.delete(id);
+    for (const [id, pulseAt] of lastPulse) if (!next.has(id) && at - pulseAt >= PULSE_INTERVAL) lastPulse.delete(id);
     if (next.size) {
-      const delay = Math.min(...[...next].map((id) => inFlight.has(id) ? 7_500 : Math.max(1, 7_500 - (now() - lastPulse.get(id)))));
+      const delay = Math.min(MAX_TIMER_DELAY, ...[...next].map((id) => inFlight.has(id)
+        ? PULSE_INTERVAL : Math.max(1, nextPulse(id) - at)));
       timer = schedule(safely(() => { timer = null; reconcile(); }), delay); timer?.unref?.();
     }
     report();
   };
-  const linkParents = () => {
-    for (const record of records.values()) {
-      record.parent = null;
-      if (typeof agents.isOwnedBy !== 'function') { error('missing-agents.isOwnedBy'); continue; }
-      for (const candidate of records.values()) if (candidate !== record && agents.isOwnedBy(record.agent.id, candidate.agent)) {
-        record.parent = candidate.agent.id; break;
-      }
-    }
-  };
   const attach = (agent) => {
     if (closed || records.get(agent.id)?.agent === agent) return;
     detach(agent.id);
-    const record = { agent, running: agent.status === 'running', parent: null, jobs: new Set(), external: new Set(), dispose: [] };
+    const record = { agent, external: new Map(), dispose: [] };
     records.set(agent.id, record);
     if (jobs?.events?.subscribe && typeof jobs.list === 'function') {
       record.dispose.push(jobs.events.subscribe({ owner: agent.id }, safely((event) => {
         if (records.get(agent.id) !== record || !event.job || event.job.owner !== agent.id) return;
-        const job = event.job;
-        if (event.type !== 'removed' && ['running', 'stopping'].includes(job.status)) record.jobs.add(job.id);
-        else record.jobs.delete(job.id);
         reconcile();
       })));
-      for (const job of jobs.list(agent.id)) if (job.owner === agent.id && ['running', 'stopping'].includes(job.status)) record.jobs.add(job.id);
     }
     if (agent.ctx?.on) {
       record.dispose.push(agent.ctx.on('subagent/start', safely((info) => {
-        if (info.local !== false || records.get(agent.id) !== record) return;
-        record.external.add(info.runId); reconcile();
+        if (info.local !== false || records.get(agent.id) !== record || agents.get(agent.id) !== agent) return;
+        const parent = info.parentSessionId === undefined ? agent : agents.get(info.parentSessionId);
+        if (typeof info.runId === 'string' && parent) record.external.set(info.runId, parent);
+        reconcile();
       })));
       record.dispose.push(agent.ctx.on('subagent/end', safely((info) => { record.external.delete(info.runId); reconcile(); })));
     }
-    linkParents(); reconcile();
+    reconcile();
   };
   if (signal?.aborted) return unavailable('aborted');
   try {
     disposers.push(ctx.on('agent/created', safely(({ agent }) => { attach(agent); })));
-    disposers.push(ctx.on('agent/status', safely(({ agent, status }) => {
-      if (!records.has(agent.id)) attach(agent);
-      const record = records.get(agent.id);
-      if (record?.agent !== agent) return;
-      record.running = status === 'running'; reconcile();
+    disposers.push(ctx.on('agent/status', safely(({ agent }) => {
+      if (agents.get(agent.id) !== agent) return;
+      if (records.get(agent.id)?.agent !== agent) attach(agent);
+      else reconcile();
     })));
     disposers.push(ctx.on('agent/disposed', safely(({ agent }) => {
       if (records.get(agent.id)?.agent !== agent) return;
-      detach(agent.id); linkParents(); reconcile();
+      detach(agent.id); reconcile();
     })));
     for (const event of ['dsh-im/session-pre-bind', 'dsh-im/session-unbind']) disposers.push(ctx.on(event, safely(reconcile)));
     for (const agent of agents.list()) attach(agent);

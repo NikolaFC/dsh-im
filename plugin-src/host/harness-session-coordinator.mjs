@@ -4,6 +4,7 @@ import {
   InboundFileError,
   stageInboundFiles,
 } from '../../src/channels/shared/inbound-file.mjs';
+import { hasPendingHarnessQuestion } from './modern-harness-api.mjs';
 
 function agentsFromContext(ctx) {
   if (typeof ctx?.get !== 'function') return undefined;
@@ -130,7 +131,7 @@ function currentOpenTurn(agent) {
   return turn !== null;
 }
 
-function createControlExecutor(agents) {
+function createControlExecutor(agents, ctx) {
   return ({ sessionId, expectedTurn, promptRpcId, continuationAfterTurn, boundSession, inputRpcId, action, text }) => {
     const agent = agents.get(sessionId);
     // An unattached Session cannot be coordinated in-process. Let the client
@@ -150,6 +151,14 @@ function createControlExecutor(agents) {
     if (action === 'steer') {
       if (typeof text !== 'string' || !text.trim()
         || typeof inputRpcId !== 'string' || !inputRpcId) return false;
+      // ReactLoopAgent in DSH 0.2.2 still reports running during cancellation
+      // unwind. When this runtime shape is available, honor its turn signal.
+      const phase = agent.phase;
+      if (phase?.kind === 'running' && phase.abort?.signal?.aborted === true) return false;
+      if (hasPendingHarnessQuestion(ctx, sessionId)) throw Object.assign(
+        new Error('The Harness turn is waiting for a question answer'),
+        { code: 'harness-question-pending' },
+      );
       // inject() never wakes an idle driver. Because validation and injection
       // share one JS tick, this context can only target this live turn's next step.
       agent.inject(steeringMessage(text, inputRpcId));
@@ -239,7 +248,7 @@ export function createHarnessSessionExecutors(ctx, provided = {}) {
     ? undefined
     : agentsFromContext(ctx);
   return {
-    controlExecutor: controlExecutor ?? (agents ? createControlExecutor(agents) : undefined),
+    controlExecutor: controlExecutor ?? (agents ? createControlExecutor(agents, ctx) : undefined),
     sessionMaintenanceExecutor: sessionMaintenanceExecutor
       ?? (agents ? createSessionMaintenanceExecutor(agents) : undefined),
     fileIngressExecutor: fileIngressExecutor

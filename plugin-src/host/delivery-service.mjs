@@ -334,15 +334,16 @@ export class DeliveryService {
     }
   }
 
-  async listSessionSyncTargets(sessionId) {
+  async listSessionSyncTargets(sessionId, options) {
     if (typeof sessionId !== 'string' || !sessionId) {
       throw deliveryError('bad-request', 'Invalid Session id');
     }
     const targets = [];
     for (const { adapter } of this.#adapters.values()) {
+      if (options?.discordGroupQuestionsOnly && adapter.channel !== 'discord') continue;
       if (!this.#supportsSessionSync(adapter)) continue;
       try {
-        const listed = await adapter.listSessionSyncTargets(sessionId);
+        const listed = await adapter.listSessionSyncTargets(sessionId, options);
         if (!Array.isArray(listed)) throw new TypeError('Adapter returned invalid sync targets');
         for (const target of listed) {
           targets.push({
@@ -361,10 +362,10 @@ export class DeliveryService {
     return targets;
   }
 
-  /** Offer a question to one unambiguous bound private chat, like synced approvals. */
+  /** Offer a question to one unambiguous, opted-in Session sync route. */
   async presentSessionSyncQuestion(sessionId, interaction, options = {}) {
     const { signal } = options;
-    const targets = await this.listSessionSyncTargets(sessionId);
+    const targets = await this.listSessionSyncTargets(sessionId, { question: true });
     if (signal?.aborted || targets.length === 0) return false;
     const candidates = new Map();
     let unresolvedTarget = false;

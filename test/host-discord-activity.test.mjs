@@ -49,7 +49,7 @@ function fixture({ send } = {}) {
   const state = { snapshot: () => ({ sessions: { ...bindings } }),
     sessionFor: (key) => masked.has(key) ? null : bindings[key] };
   const f = {
-    ctx, state, calls, live, timers, bindings, effects, masked,
+    ctx, state, calls, live, jobRows, timers, bindings, effects, masked,
     add(id, status = 'idle', parent) {
       const agent = { id, status, parent, ctx: events(), session: { header: { parentSession: 'irrelevant' } } };
       live.set(id, agent);
@@ -281,6 +281,102 @@ test('external live activations hydrate across observer restart, settle, and rej
   await f.tick(15000); assert.equal(f.calls.length, 2); f.abort();
 });
 
+test('receiving no idle or job settlement event cannot keep an idle channel typing', async () => {
+  const f = fixture();
+  const a = f.add('foreground', 'running');
+  const b = f.add('background');
+  f.bind('group:111', a.id);
+  f.bind('group:222', b.id);
+  f.job('job', b.id, 'running');
+  f.start();
+  await flush();
+  assert.equal(f.calls.length, 2);
+  a.status = 'idle';
+  f.jobRows.get('job').status = 'completed';
+  await f.tick(15_000);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.timers.size, 0);
+  f.abort();
+});
+
+test('modern resident activations follow verified ancestors and retire without an external end event', async () => {
+  const f = fixture();
+  const root = f.add('root');
+  const middle = f.add('middle');
+  const leaf = f.add('leaf', 'running');
+  const agents = f.ctx.get('agents');
+  delete agents.isOwnedBy;
+  const resident = new Map([
+    ['middle', { kind: 'local', childId: middle.id, root, ancestors: [root.id], handle: { agent: middle } }],
+    ['leaf', { kind: 'local', childId: leaf.id, root, ancestors: [root.id, middle.id], handle: { agent: leaf } }],
+  ]);
+  const get = f.ctx.get;
+  f.ctx.get = name => name === 'subagents' ? { manager: { resident } } : get(name);
+  f.bind('group:111', root.id);
+  f.bind('group:222', middle.id);
+  f.start();
+  await flush();
+  assert.deepEqual(f.calls.map(c => c.channelId).sort(), ['111', '222']);
+  f.status(leaf, 'idle');
+  assert.equal(f.timers.size, 0);
+
+  resident.set('external', { kind: 'external', childId: 'external', root, ancestors: [root.id, middle.id] });
+  root.ctx.emit('subagent/start', { runId: 'external-run', id: 'external', parentSessionId: middle.id, local: false });
+  await f.tick(450_000);
+  assert.equal(f.calls.length, 2 * 61);
+  assert.deepEqual(f.calls.slice(-2).map(c => c.channelId).sort(), ['111', '222']);
+  resident.delete('external');
+  await f.tick(15_000);
+  assert.equal(f.calls.length, 2 * 61);
+  assert.equal(f.timers.size, 0);
+  f.abort();
+});
+
+test('public ownership and root-carried events preserve the direct parent when the activation map is unavailable', async () => {
+  const f = fixture();
+  const root = f.add('root');
+  const middle = f.add('middle', 'running');
+  const agents = f.ctx.get('agents');
+  delete agents.isOwnedBy;
+  const get = f.ctx.get;
+  f.ctx.get = name => name === 'subagents'
+    ? { rootOf: agent => agent === middle ? root : agent } : get(name);
+  f.bind('group:111', root.id);
+  f.bind('group:222', middle.id);
+  f.start();
+  await flush();
+  assert.equal(f.calls.length, 2);
+  f.status(middle, 'idle');
+  assert.equal(f.timers.size, 0);
+  const external = { runId: 'external-run', id: 'external', parentSessionId: middle.id, local: false };
+  root.ctx.emit('subagent/start', external);
+  await f.tick(7_500);
+  assert.deepEqual(f.calls.slice(2).map(c => c.channelId).sort(), ['111', '222']);
+  root.ctx.emit('subagent/end', external);
+  assert.equal(f.timers.size, 0);
+  f.abort();
+});
+
+test('an activation from a replaced Agent identity does not keep its replacement typing', async () => {
+  const f = fixture();
+  const old = f.add('root');
+  const resident = new Map([
+    ['external', { kind: 'external', childId: 'external', root: old, ancestors: [old.id] }],
+  ]);
+  const get = f.ctx.get;
+  f.ctx.get = name => name === 'subagents' ? { manager: { resident } } : get(name);
+  f.bind('group:111', old.id);
+  f.start();
+  await flush();
+  assert.equal(f.calls.length, 1);
+  f.add(old.id);
+  assert.equal(old.ctx.count(), 0);
+  await f.tick(15_000);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.timers.size, 0);
+  f.abort();
+});
+
 test('diagnostics report attachment, busy route, errors and stop without content', async () => {
   const f = fixture({ send: () => Promise.reject(new Error('private contents')) });
   const a = f.add('parent', 'running'); f.bind('group:111', a.id);
@@ -290,11 +386,63 @@ test('diagnostics report attachment, busy route, errors and stop without content
   assert.deepEqual(snapshots.at(-1).channels, ['111']);
   assert.ok(snapshots.at(-1).busySessions.includes(a.id));
   assert.ok(snapshots.at(-1).errors.includes('typing-send-failed'));
+  assert.deepEqual(snapshots.at(-1).lastFailure, { at: 0, channelId: '111', kind: 'unknown' });
   assert.ok(!JSON.stringify(snapshots).includes('private contents'));
   f.abort(); assert.equal(snapshots.at(-1).attached, false);
   const missing = [];
   assert.equal(observeDiscordActivity({ get: () => undefined }, { diagnostics: (v) => missing.push(v) }), null);
   assert.equal(missing[0].reason, 'missing-agents');
+});
+
+test('typing diagnostic reports safe rate-limit data and follows the shared cooldown', async () => {
+  const status = Object.assign(new Error('private contents'), { status: 429, providerCode: 20028, retryAfter: 30 });
+  let count = 0;
+  const f = fixture({ send: () => {
+    if (++count === 1) throw status;
+    if (count === 2) return { sent: false, lastPulseAt: 29_000, nextPulseAt: 65_000 };
+  } });
+  const a = f.add('parent', 'running');
+  f.bind('group:111', a.id);
+  let diagnostic;
+  f.diagnostics = value => { diagnostic = value; };
+  f.start();
+  await flush();
+  assert.deepEqual(diagnostic.lastFailure,
+    { at: 0, channelId: '111', kind: 'http', status: 429, providerCode: 20028, retryAfterMs: 30_000 });
+  assert.doesNotMatch(JSON.stringify(diagnostic), /private contents/u);
+  await f.tick(29_999);
+  assert.equal(f.calls.length, 1);
+  await f.tick(1);
+  assert.equal(f.calls.length, 2);
+  await f.tick(35_000);
+  assert.deepEqual(f.calls.map(call => call.at), [0, 30_000, 65_000]);
+  f.abort();
+});
+
+test('long Discord cooldowns cap the timer and a late shutdown error is ignored', async () => {
+  const f = fixture({ send: () => ({ sent: false, lastPulseAt: 0, nextPulseAt: Number.MAX_SAFE_INTEGER }) });
+  const a = f.add('parent', 'running');
+  f.bind('group:111', a.id);
+  f.start();
+  await flush();
+  assert.equal([...f.timers.values()][0].at, 2 ** 31 - 1);
+  await f.tick(2 ** 31 - 1);
+  assert.equal(f.calls.length, 1);
+  assert.equal([...f.timers.values()][0].at, 2 * (2 ** 31 - 1));
+  f.abort();
+
+  let reject;
+  const shutdown = fixture({ send: () => new Promise((_resolve, fail) => { reject = fail; }) });
+  shutdown.bind('direct:222', shutdown.add('b', 'running').id);
+  let diagnostic;
+  shutdown.diagnostics = value => { diagnostic = value; };
+  shutdown.start();
+  await flush();
+  shutdown.abort();
+  reject(new Error('late shutdown error'));
+  await flush();
+  assert.equal(diagnostic.lastFailure, null);
+  assert.deepEqual(diagnostic.errors, []);
 });
 
 test('malformed external manager degrades coverage without disabling foreground', async () => {
