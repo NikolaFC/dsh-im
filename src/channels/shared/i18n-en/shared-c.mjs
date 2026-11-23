@@ -96,6 +96,8 @@ export default {
     'Reply with an option number or its text, or type your own answer directly.',
   '请点击下方按钮选择，也可直接回复文字。':
     'Tap a button below to choose, or reply with text directly.',
+  '跳过此题': 'Skip this question',
+  '已跳过此题。': 'Question skipped.',
   '请直接回复你的答案。': 'Please reply with your answer directly.',
   '群聊中请 @机器人 后发送答案。':
     'In group chats, please @ the bot before sending your answer.',

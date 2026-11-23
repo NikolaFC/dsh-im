@@ -78,13 +78,14 @@ async function fixture(t, { thread = false, questionFromPrompt = false, cardGate
   const activeTurns = [];
   const turnSignal = new AbortController();
   const session = { id: sessionId, snapshotEvents: () => events };
-  const requestQuestion = ({ id = sessionId, signal, origin = 'goal', native = noProvider }) => {
+  const requestQuestion = ({ id = sessionId, signal, origin = 'goal', native = noProvider,
+    questions: requestedQuestions = questions }) => {
     const snapshotEvents = () => origin === 'live' ? events : [
       { type: 'turn/start', seq: 0, data: { turn: 1 } },
       ...(origin === 'desktop' ? [{ type: 'user/message', seq: 1,
         data: { turn: 1, source: { kind: 'user', rpcId: 'desktop-prompt' } } }] : []),
     ];
-    const request = { agent: { session: { id, snapshotEvents } }, questions, signal };
+    const request = { agent: { session: { id, snapshotEvents } }, questions: requestedQuestions, signal };
     const result = listeners.get('user-questions/request')(request, native);
     void result.catch(() => {});
     return { request, result };
@@ -219,18 +220,25 @@ async function fixture(t, { thread = false, questionFromPrompt = false, cardGate
         author: { id: user, bot: false }, content });
       return id;
     },
-    async choose(card, { user = actor, route = channelId } = {}) {
+    async choose(card, { user = actor, route = channelId, component = card.components[0].components[0],
+      providerMessageId = card.id, values = component.type === 3 ? ['0'] : undefined } = {}) {
       const id = nextId();
       const nonce = `click-${id}`;
-      const { custom_id } = card.components[0].components[0];
       socket.dispatch('INTERACTION_CREATE', { id, token: nonce, application_id: platformId, channel_id: route,
         guild_id: DISCORD_COMMAND_GUILD, type: 3, member: { user: { id: user } },
-        message: { id: card.id, author: { id: platformId } },
-        data: { custom_id, component_type: 3, values: ['0'] } });
+        message: { id: providerMessageId, author: { id: platformId } },
+        data: { custom_id: component.custom_id, component_type: component.type, values } });
       await until(() => followups.some(reply => reply.token === nonce), 'card press did not finish');
       assert.equal(acknowledgements.find(ack => ack.token === nonce)?.type, 6);
     },
   };
+}
+
+function skipComponent(card) {
+  const component = card.components.flatMap((row) => row.components)
+    .find((item) => item.type === 2 && item.label === translate('跳过此题'));
+  assert.ok(component, 'Discord should display an explicit Skip button');
+  return component;
 }
 
 test('Discord-origin question still reaches the ordinary turn watcher exactly once', async (t) => {
@@ -311,6 +319,88 @@ test('desktop question in a synced Discord group rejects the wrong actor and cha
   assert.equal(q.request.signal.aborted, true);
   assert.deepEqual(f.prompts, []);
   assert.ok(f.edits.some(edit => edit.messageId === card.id && edit.components.length === 0));
+});
+
+for (const requestedQuestions of [questions, [{ id: 'open', question: 'Anything else?' }]]) {
+  test(`Discord Skip answers ${requestedQuestions[0].options ? 'a single-choice' : 'an open-ended'} question without a prompt`, async (t) => {
+    const f = await fixture(t);
+    const turn = new AbortController();
+    const q = f.requestQuestion({ origin: 'desktop', signal: turn.signal, questions: requestedQuestions });
+    await until(() => f.cards.length === 1, 'synced group did not receive a question card');
+    const [card] = f.cards;
+    const component = skipComponent(card);
+    assert.equal(card.components.flatMap((row) => row.components).some((item) => item.type === 3),
+      Boolean(requestedQuestions[0].options));
+
+    await f.choose(card, { component, user: otherActor });
+    await f.choose(card, { component, route: otherChannelId });
+    await f.choose(card, { component, providerMessageId: '555555555555555555' });
+    assert.equal(q.request.signal.aborted, false);
+    assert.deepEqual(f.edits, []);
+
+    await Promise.all([f.choose(card, { component }), f.choose(card, { component })]);
+    assert.deepEqual(await q.result, { answers: [{ id: requestedQuestions[0].id, selected: [] }] });
+    assert.equal(turn.signal.aborted, false);
+    await until(() => f.edits.some((edit) => edit.messageId === card.id), 'answered Skip card was not retired');
+    assert.equal(f.edits.filter((edit) => edit.messageId === card.id && edit.components.length === 0).length, 1);
+    assert.deepEqual(f.prompts, []);
+  });
+}
+
+test('Discord Skip advances a group and stale controls cannot change its next question', async (t) => {
+  const f = await fixture(t);
+  const q = f.requestQuestion({ questions: [
+    { id: 'first', question: 'Skip this one?', options: [{ label: 'Yes' }] },
+    { id: 'second', question: 'Pick two', multiSelect: true, options: [{ label: '2' }, { label: 'A' }] },
+  ] });
+  await until(() => f.cards.length === 1, 'first grouped Discord question not shown');
+  const [first] = f.cards;
+  const staleSkip = skipComponent(first);
+  await f.choose(first, { component: staleSkip });
+  await until(() => f.cards.length === 2, 'Skip did not advance the group');
+  const second = f.cards[1];
+  await f.choose(first, { component: staleSkip });
+  await f.choose(second, { component: staleSkip });
+  assert.equal(q.request.signal.aborted, false, 'Only the second question can finish the group');
+  await f.choose(second, { values: ['0', '1'] });
+
+  assert.deepEqual(await q.result, { answers: [{ id: 'first', selected: [] },
+    { id: 'second', selected: ['2', 'A'] }] });
+  assert.deepEqual(f.prompts, []);
+});
+
+test('Discord sends the full long question separately and answers with the unshortened label', async (t) => {
+  const f = await fixture(t);
+  const label = 'Long option ' + '字'.repeat(115);
+  const q = f.requestQuestion({ questions: [{
+    id: 'long', question: 'Which option?', detail: 'Details before choices: ' + 'x'.repeat(2100),
+    options: [{ label }, { label: 'Short option' }],
+  }] });
+  await until(() => f.cards.length === 1, 'the long question omitted its selection card');
+  const [card] = f.cards;
+  assert.ok(f.textMessages.some((message) => message.content.includes(label)), 'full option text was lost');
+  assert.ok(card.content.length <= 2000);
+  const menu = card.components.flatMap((row) => row.components).find((item) => item.type === 3);
+  assert.ok(menu.options[0].label.length <= 100);
+  await f.choose(card, { component: menu });
+  assert.deepEqual(await q.result, { answers: [{ id: 'long', selected: [label] }] });
+  assert.deepEqual(f.prompts, []);
+});
+
+test('a native answer retires a Discord Skip button before a delayed press', async (t) => {
+  const f = await fixture(t);
+  const native = Promise.withResolvers();
+  t.after(() => native.resolve(no));
+  const q = f.requestQuestion({ native: () => native.promise });
+  await until(() => f.cards.length === 1, 'question was not displayed before the native answer');
+  const [card] = f.cards;
+  const component = skipComponent(card);
+  native.resolve(no);
+  assert.deepEqual(await q.result, no);
+  await until(() => f.edits.some((edit) => edit.messageId === card.id), 'native answer did not retire the card');
+  await f.choose(card, { component });
+  assert.deepEqual(f.prompts, []);
+  assert.equal(f.cards.length, 1);
 });
 
 test('goal question uses the opted-in Discord thread and accepts a typed answer without steering', async (t) => {

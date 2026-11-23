@@ -13,6 +13,7 @@ import { DiscordApi } from '../../../src/channels/discord/discord-api.mjs';
 import { DiscordBotClient, DiscordRuntime } from '../../../src/channels/discord/discord-runtime.mjs';
 import { DiscordHarnessClient } from '../../../src/channels/discord/harness-client.mjs';
 import { DiscordStateStore } from '../../../src/channels/discord/state-store.mjs';
+import { TELEGRAM_INTERACTION_CARD } from '../../../src/channels/telegram/telegram-bridge.mjs';
 import { BotWorkspaceStore, createBotWorkspaceScope } from '../../../src/channels/shared/bot-workspace-store.mjs';
 import { directAccessPolicy } from '../access-policy-fixture.mjs';
 
@@ -287,8 +288,62 @@ test('native multi select is bounded and has exact index identity', () => {
   for (const values of [[], ['0', '0'], ['1e0'], ['-1'], ['00']]) {
     assert.equal(DISCORD_INTERACTION_CARD.parse(select.custom_id, { componentType: 3, values }), null);
   }
-  assert.equal(DISCORD_INTERACTION_CARD.render({ ...question, options: Array(26).fill({ label: 'a' }) }, { nonce: 'n' }), null);
   assert.deepEqual(discordCardComponents({ inline_keyboard: [] }), []);
+});
+
+test('Discord Skip is a distinct button callback and remains available with free text', () => {
+  const nonce = 'nonce', questionIndex = 2;
+  for (const options of [undefined, [{ label: 'A' }, { label: 'B' }]]) {
+    const card = DISCORD_INTERACTION_CARD.render({ id: 'x', question: 'Choose', options }, { nonce, questionIndex });
+    const components = card.markup.components.flatMap((row) => row.components);
+    const skip = components.find((component) => component.type === 2);
+    assert.equal(skip.custom_id, 'dq1|nonce|2|skip');
+    assert.deepEqual(DISCORD_INTERACTION_CARD.parse(skip.custom_id, { componentType: 2 }),
+      { action: 'skip', nonce, questionIndex });
+    assert.equal(DISCORD_INTERACTION_CARD.parse(skip.custom_id, { componentType: 3, values: ['0'] }), null);
+    assert.equal(DISCORD_INTERACTION_CARD.parse(skip.custom_id, { componentType: 2, values: ['0'] }), null);
+    assert.equal(components.some((component) => component.type === 3), Boolean(options));
+  }
+});
+
+test('Discord approval and plan intents cannot be skipped with a forged question action', () => {
+  for (const intent of ['approval', 'plan']) {
+    const question = { id: 'x', question: 'Confirm', intent, options: [{ label: 'Yes' }] };
+    const card = DISCORD_INTERACTION_CARD.render(question, { nonce: 'nonce' });
+    assert.deepEqual(card.markup.components.flatMap((row) => row.components).map((item) => item.type), [3]);
+    const forged = DISCORD_INTERACTION_CARD.parse('dq1|nonce|0|skip', { componentType: 2 });
+    assert.equal(DISCORD_INTERACTION_CARD.accepts(question, forged), false);
+  }
+});
+
+test('Discord oversized labels and text preserve the full question and exact option index', () => {
+  const longLabel = '长选项 ' + '字'.repeat(110);
+  const detail = 'Synthetic detail ' + 'x'.repeat(2100);
+  const question = { id: 'x', question: 'Choose', detail, options: [{ label: longLabel }, { label: 'Short' }] };
+  const card = DISCORD_INTERACTION_CARD.render(question, { nonce: 'nonce' });
+  assert.ok(card.prelude.includes(longLabel));
+  assert.ok(card.prelude.includes(detail));
+  assert.ok(card.text.length <= 2000);
+  const components = card.markup.components.flatMap((row) => row.components);
+  const menu = components.find((component) => component.type === 3);
+  assert.ok(menu.options[0].label.length <= 100);
+  assert.deepEqual(menu.options.map((option) => option.value), ['0', '1']);
+  assert.ok(components.some((component) => component.type === 2));
+
+  const tooMany = Array.from({ length: 26 }, (_, index) => ({ label: `Option ${index + 1}` }));
+  const fallback = DISCORD_INTERACTION_CARD.render({ ...question, detail: undefined, options: tooMany }, { nonce: 'nonce' });
+  assert.match(fallback.prelude ?? fallback.text, /26\. Option 26/u);
+  assert.deepEqual(fallback.markup.components.flatMap((row) => row.components).map((component) => component.type), [2]);
+});
+
+test('Discord Skip does not add a control or callback to the Telegram adapter', () => {
+  const question = { id: 'x', question: 'Choose', options: [{ label: 'A' }] };
+  const telegram = TELEGRAM_INTERACTION_CARD.render(question, { nonce: 'nonce', questionIndex: 2 });
+  assert.deepEqual(telegram.markup.inline_keyboard.flat().map((item) => item.text), ['A']);
+  assert.deepEqual(TELEGRAM_INTERACTION_CARD.parse(telegram.markup.inline_keyboard[0][0].callback_data),
+    { nonce: 'nonce', questionIndex: 2, optionIndex: 0 });
+  assert.equal(TELEGRAM_INTERACTION_CARD.parse('dq1|nonce|2|skip'), null);
+  assert.equal(TELEGRAM_INTERACTION_CARD.render({ ...question, options: [] }, { nonce: 'nonce' }), null);
 });
 
 test('approval adapter rejects another route and stranger without consuming real decision', async () => {

@@ -174,28 +174,67 @@ export function normalizeDiscordInteraction(interaction, applicationId) {
   };
 }
 
+const CARD_TEXT_LIMIT = 1900;
+const SELECT_LABEL_LIMIT = 100;
+const SELECT_OPTION_LIMIT = 25;
+
+function canSelect(question) {
+  const options = question?.options;
+  return Array.isArray(options) && options.length > 0 && options.length <= SELECT_OPTION_LIMIT
+    && options.every(option => typeof option?.label === 'string' && !!option.label.trim()
+      && !/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/u.test(option.label));
+}
+
+function discordSelectLabel(label, index) {
+  const text = label.replace(/[\r\n\t]+/g, ' ');
+  if (text.length <= SELECT_LABEL_LIMIT) return text;
+  // The full original labels stay in the numbered question above the menu.
+  // An ordinal distinguishes similar truncations. The wire value stays an index.
+  const prefix = `${index + 1}. `;
+  const preview = text.slice(0, SELECT_LABEL_LIMIT - prefix.length - 1).replace(/[\ud800-\udbff]$/u, '');
+  return `${prefix}${preview}…`;
+}
+
 export const DISCORD_INTERACTION_CARD = Object.freeze({
   render(question, { questionIndex = 0, total = 1, nonce, requiresMention = false } = {}) {
-    const options = question?.options;
-    if (!/^[A-Za-z0-9_-]{1,16}$/.test(nonce ?? '') || !Array.isArray(options)
-      || options.length < 1 || options.length > 25
-      || options.some(option => typeof option?.label !== 'string' || !option.label.trim()
-        || option.label.length > 100)) return null;
-    const text = harnessQuestionText(question, questionIndex, total, { requiresMention, hasButtons: true });
-    if (text.length > 1900) return null;
-    return { text, markup: { components: [{ type: 1, components: [{
-      type: 3, custom_id: `dq1|${nonce}|${questionIndex}`, min_values: 1,
-      max_values: question.multiSelect === true ? options.length : 1,
-      options: options.map((option, index) => ({ label: option.label, value: String(index) })),
-    }] }] } };
+    if (!question || !/^[A-Za-z0-9_-]{1,16}$/.test(nonce ?? '')
+      || !Number.isInteger(questionIndex) || questionIndex < 0 || questionIndex > 9999) return null;
+    const selectable = canSelect(question);
+    const skippable = question.intent === undefined;
+    const id = `dq1|${nonce}|${questionIndex}`;
+    const components = [];
+    if (selectable) components.push({ type: 1, components: [{
+      type: 3, custom_id: id, min_values: 1,
+      max_values: question.multiSelect === true ? question.options.length : 1,
+      options: question.options.map((option, index) => ({ label: discordSelectLabel(option.label, index), value: String(index) })),
+    }] });
+    if (skippable) components.push({ type: 1, components: [{
+      type: 2, style: 2, custom_id: `${id}|skip`, label: t('跳过此题'),
+    }] });
+    if (!components.length) return null;
+    const markup = { components };
+    const text = harnessQuestionText(question, questionIndex, total, { requiresMention, hasButtons: selectable });
+    if (text.length <= CARD_TEXT_LIMIT) return { text, markup };
+    return {
+      prelude: harnessQuestionText(question, questionIndex, total, { requiresMention }),
+      text: selectable ? t('请点击下方按钮选择，也可直接回复文字。') : t('请直接回复你的答案。'),
+      markup,
+    };
   },
   parse(data, callback) {
-    const match = /^dq1\|([A-Za-z0-9_-]{1,16})\|(\d{1,4})$/.exec(data ?? '');
+    const match = /^dq1\|([A-Za-z0-9_-]{1,16})\|(\d{1,4})(\|skip)?$/.exec(data ?? '');
+    if (!match) return null;
+    const result = { nonce: match[1], questionIndex: Number(match[2]) };
     const values = callback?.values;
-    if (!match || callback?.componentType !== 3 || !Array.isArray(values)
-      || values.length < 1 || values.length > 25 || new Set(values).size !== values.length
-      || values.some(value => typeof value !== 'string' || !/^(0|[1-9]\d?)$/.test(value))) return null;
-    return { nonce: match[1], questionIndex: Number(match[2]), optionIndexes: values.map(Number) };
+    if (match[3]) return callback?.componentType === 2 && values === undefined ? { ...result, action: 'skip' } : null;
+    if (callback?.componentType !== 3 || !Array.isArray(values)
+      || values.length < 1 || values.length > SELECT_OPTION_LIMIT || new Set(values).size !== values.length
+      || values.some(value => typeof value !== 'string' || !/^(0|[1-9]\d?)$/.test(value)
+        || Number(value) >= SELECT_OPTION_LIMIT)) return null;
+    return { ...result, optionIndexes: values.map(Number) };
+  },
+  accepts(question, press) {
+    return press.action === 'skip' ? question.intent === undefined : canSelect(question);
   },
 });
 

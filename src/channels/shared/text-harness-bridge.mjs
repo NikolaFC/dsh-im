@@ -1763,7 +1763,7 @@ export class TextHarnessBridge {
 
     const target = message.replyTarget;
     const text = controlTextOf(message);
-    if (!text || hasInboundImages(message) || hasInboundFiles(message)) {
+    if ((!text && !cardReply) || hasInboundImages(message) || hasInboundFiles(message)) {
       try {
         await this.#bot.sendText(target, t('请用文字回答当前问题。'));
       } catch (error) {
@@ -1956,9 +1956,8 @@ export class TextHarnessBridge {
   }
 
   /**
-   * Accept an inline-keyboard press. The press is replayed as the option label the
-   * text flow already understands, so a button and a typed reply share one
-   * submission path and cannot drift apart.
+   * Accept an inline-keyboard press. Structured choices and skips use the same
+   * validated answer submission as a typed reply.
    */
   async acceptCallback(callback) {
     if (this.#signal?.aborted) return;
@@ -2008,9 +2007,14 @@ export class TextHarnessBridge {
 
     const question = pending.questions[pending.index];
     const parsed = this.#interactionCard?.parse?.(callback.data, callback) ?? null;
+    const skip = parsed?.action === 'skip';
+    const providerBound = skip || Array.isArray(parsed?.optionIndexes);
+    if (providerBound && pending.claimedReplyMessageId) {
+      return notice(t('正在提交你的选择，请稍候。'));
+    }
     // Native select adapters may supply a complete set of indexes. Legacy
     // button adapters retain their single optionIndex contract.
-    const indexes = parsed?.optionIndexes ?? [parsed?.optionIndex];
+    const indexes = skip ? [] : parsed?.optionIndexes ?? [parsed?.optionIndex];
     const selectedOptions = Array.isArray(indexes) && indexes.length > 0
       && new Set(indexes).size === indexes.length
       && indexes.every(index => Number.isInteger(index) && index >= 0
@@ -2018,53 +2022,62 @@ export class TextHarnessBridge {
       ? indexes.map(index => question.options[index]) : [];
     const option = selectedOptions[0];
     if (!question || !parsed
-      || (parsed.optionIndexes && pending.cardMessageId
+      || (providerBound && pending.cardMessageId
         && callback.providerMessageId !== pending.cardMessageId)
       || !pending.cardNonce || parsed.nonce !== pending.cardNonce
       || parsed.questionIndex !== pending.index
-      || !option || typeof option.label !== 'string'
-      || (question.multiSelect !== true && selectedOptions.length !== 1)) {
+      || this.#interactionCard.accepts?.(question, parsed) === false
+      || (skip ? pending.kind !== 'question' || question.intent !== undefined
+        : !option || (question.multiSelect !== true && selectedOptions.length !== 1))) {
       return notice(t('这个选项已失效，请使用最新一条问题。'));
     }
     // Only adapters returning a full validated selection opt into multi-select.
-    if (question.multiSelect === true && !parsed.optionIndexes) {
+    if (!skip && question.multiSelect === true && !parsed.optionIndexes) {
       return notice(t('多选问题请直接回复文字。'));
     }
 
     pending.callbackClaimed = true;
-    // A press can beat the card's own send promise — Telegram delivers the update
-    // as soon as its API accepted the keyboard. Wait for delivery so the card id
-    // exists and the shared submission path can retire its keyboard.
-    await pending.presentationTask?.catch(() => undefined);
-    await notice(t('已选择：{label}', { label: option.label }));
-    await this.#processInteractionReply(
-      {
-        kind,
-        conversationId,
+    if (providerBound) pending.claimedReplyMessageId = messageId;
+    const stillCurrent = () => this.#pendingInteractions.get(key) === pending
+      && pending.index === parsed.questionIndex && pending.cardNonce === parsed.nonce
+      && (!providerBound || (pending.cardMessageId && callback.providerMessageId === pending.cardMessageId));
+    try {
+      // The provider can deliver a press before its card-send promise settles.
+      // Wait for the exact card message ID before accepting native components.
+      await pending.presentationTask?.catch(() => undefined);
+      if (!stillCurrent()) return await notice(t('这个选项已失效，请使用最新一条问题。'));
+      await notice(skip ? t('已跳过此题。') : t('已选择：{label}', { label: option.label }));
+      await this.#processInteractionReply(
+        {
+          kind,
+          conversationId,
+          messageId,
+          senderId,
+          addressed: true,
+          content: option?.label ?? '',
+          replyTarget: callback.replyTarget ?? pending.target,
+          statusReaction: null,
+        },
         messageId,
         senderId,
-        addressed: true,
-        content: option.label,
-        replyTarget: callback.replyTarget ?? pending.target,
-        statusReaction: null,
-      },
-      messageId,
-      senderId,
-      key,
-      pending,
-      // The press already identifies its option by index, so answer with that
-      // exact label. Replaying the label as reply text would re-parse a numeric
-      // label such as "2" as the second option and submit a different one.
-      { resolveAnswer: (current) => ({ id: current.id, selected: selectedOptions.map(item => item.label) }) },
-    ).catch((error) => {
+        key,
+        pending,
+        // The selected labels are the originals, even if a Discord preview was
+        // shortened or the label looks like a numbered text reply.
+        { resolveAnswer: (current) => current === question && stillCurrent()
+          ? { id: current.id, selected: selectedOptions.map(item => item.label) }
+          : null },
+      );
+    } catch (error) {
       this.#logger.error?.(
         `[dsh-im:${this.#descriptor.key}] failed to submit a card answer:`,
         error,
       );
-    }).finally(() => {
+    } finally {
       // A failed submission rolls the question back, so let the user press again.
       if (this.#pendingInteractions.get(key) === pending) pending.callbackClaimed = false;
-    });
+      if (providerBound && pending.claimedReplyMessageId === messageId) pending.claimedReplyMessageId = null;
+    }
   }
 
   /**
@@ -2439,6 +2452,14 @@ export class TextHarnessBridge {
       pending.cardNonce = randomUUID().slice(0, 8);
       const card = this.#interactionCardFor(pending, question);
       if (card) {
+        const prelude = typeof card.prelude === 'string' && card.prelude;
+        if (prelude) {
+          await this.#bot.sendText(pending.target, prelude);
+          if (pending.synced) {
+            await pending.synced.validate();
+            if (!this.#interactionKeys.has(pending.interactionId)) return;
+          }
+        }
         try {
           const sent = await this.#bot.sendInteractionCard(pending.target, {
             text: card.text,
@@ -2459,6 +2480,11 @@ export class TextHarnessBridge {
               + 'falling back to plain text:',
             error?.message ?? error,
           );
+          if (prelude) {
+            // The full plain-text question already offered an answer by text.
+            pending.needsPresentation = false;
+            return;
+          }
         }
       }
       if (pending.synced) {
